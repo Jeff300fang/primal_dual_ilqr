@@ -28,24 +28,25 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c):
       P, p: updated matrices encoding quadratic value function.
     """
     symmetrize = lambda x: 0.5 * (x + x.T)
-    AtP = A.T @ P 
-    AtPA = AtP @ A
+
+    AtP = A.T @ P
+    AtPA = symmetrize(AtP @ A)
     BtP = B.T @ P
     BtPA = BtP @ A
 
     H = BtPA + M.T
     h = B.T @ p + BtP @ c + r
 
-    G = R + BtP @ B
+    G = symmetrize(R + BtP @ B)
 
-    # K_k = solve_symmetric_positive_definite_system(
-    #     G, -np.hstack((H, h.reshape([-1, 1])))
-    # )
-    K_k = np.linalg.solve(G, -np.hstack((H, h.reshape([-1, 1]))))
+    K_k = solve_symmetric_positive_definite_system(
+        G, -np.hstack((H, h.reshape([-1, 1])))
+    )
+
     K = K_k[:, :-1]
     k = K_k[:, -1]
 
-    P = Q + AtPA + K.T @ H
+    P = symmetrize(Q + AtPA + K.T @ H)
     p = q + A.T @ p + AtP @ c + K.T @ h
 
     return K, k, P, p

@@ -162,12 +162,9 @@ def compute_search_direction(
     R = R_pad[:-1]
     M = M_pad[:-1]
 
-    if limited_memory:
-        linearizer = linearize_obj_scan(lagrangian(cost, dynamics, x0),argnums = 5)
-        dynamics_linearizer = linearize_scan(dynamics)
-    else :
-        linearizer = linearize(lagrangian(cost, dynamics, x0),argnums = 5)
-        dynamics_linearizer = linearize(dynamics)
+    linearizer = linearize(lagrangian(cost, dynamics, x0),argnums = 5)
+    dynamics_linearizer = linearize(dynamics)
+
     q, r_pad = linearizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
     r = r_pad[:-1]
 
@@ -183,17 +180,6 @@ def compute_search_direction(
         dX, dU = rollout_gpu(K, k, c[0], A, B, c[1:])
     
     dV = dual_lqr(dX, P, p)
-    # dV = dual_lqr_backward(Q, q, M, A, dX, dU)
-    # dV = dual_lqr_gpu(Q, q, M, A, dX, dU)
-
-    # new_dX, new_dU, new_dV, LHS, rhs = tvlqr_kkt(Q, q, R, r, M, A, B, c[1:], c[0])
-
-    # candidate_sol = np.concatenate([dX.flatten(), dU.flatten(), dV.flatten()])
-    # candidate_sol = np.concatenate([new_dX.flatten(), new_dU.flatten(), new_dV.flatten()])
-    # error = LHS @ candidate_sol - rhs
-    # debug.print(f"error_norm={np.linalg.norm(error)}")
-
-    # return new_dX, new_dU, new_dV, q, r
 
     return dX, dU, dV, q, r
 @jit
@@ -474,8 +460,7 @@ def filter_line_search(
         body,
         (X_in, U_in, V_in, alpha, False)
     )
-    jax.debug.print("{}",alpha)
-
+    
     return X, U, V
 @partial(jit, static_argnums=(0))
 def parallel_filter_line_search(
