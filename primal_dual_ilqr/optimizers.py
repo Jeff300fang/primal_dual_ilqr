@@ -426,25 +426,28 @@ def filter_line_search(
         phi_new = new_cost
 
         # Case 1: Large constraint violation but improving
+        condition1 = theta_new > theta_max
         case1 = np.logical_and(
-            theta_new > theta_max,
+            condition1,
             theta_new < (1 - gamma_theta) * theta_k
         )
 
         # Case 2: Small constraint violations and cost is decreasing
-        case2 = np.logical_and(
-            np.logical_and(
+        condition2 =  np.logical_and(
                 np.maximum(theta_new, theta_k) < theta_min,
                 slope < 0
-            ),
+            )
+        case2 = np.logical_and(
+           condition2,
             phi_new < phi_k + eta * alpha * slope
         )
 
         # Case 3: Either cost or constraint violation is significantly reduced
-        case3 = np.logical_or(
-            phi_new < phi_k - gamma_phi * theta_k,
+        condition3 = np.logical_not(np.logical_or(condition1, condition2))
+        case3 = np.logical_and(condition3,np.logical_or(
+            phi_new < phi_k - gamma_phi * phi_k,
             theta_new < (1 - gamma_theta) * theta_k
-        )
+        ))
 
         # Accept if any case is satisfied
         new_accepted = np.logical_or(np.logical_or(case1, case2), case3)
@@ -536,25 +539,28 @@ def parallel_filter_line_search(
         phi_new = new_cost
 
         # Case 1: Large constraint violation but improving
+        condition1 = theta_new > theta_max
         case1 = np.logical_and(
-            theta_new > theta_max,
+            condition1,
             theta_new < (1 - gamma_theta) * theta_k
         )
 
         # Case 2: Small constraint violations and cost is decreasing
-        case2 = np.logical_and(
-            np.logical_and(
+        condition2 =  np.logical_and(
                 np.maximum(theta_new, theta_k) < theta_min,
                 slope < 0
-            ),
+            )
+        case2 = np.logical_and(
+           condition2,
             phi_new < phi_k + eta * alpha * slope
         )
 
         # Case 3: Either cost or constraint violation is significantly reduced
-        case3 = np.logical_or(
-            phi_new < phi_k - gamma_phi * theta_k,
+        condition3 = np.logical_not(np.logical_or(condition1, condition2))
+        case3 = np.logical_and(condition3,np.logical_or(
+            phi_new < phi_k - gamma_phi * phi_k,
             theta_new < (1 - gamma_theta) * theta_k
-        )
+        ))
 
         # Accept if any case is satisfied
         new_accepted = np.logical_or(np.logical_or(case1, case2), case3)
