@@ -615,12 +615,12 @@ def mpc(
     V_in,
     ):
 
-    _cost = partial(cost,W,reference)
+    _cost = partial(cost,parameter,W,reference)
     if hessian_approx is not None:
-        _hessian_approx = partial(hessian_approx,W,reference)
+        _hessian_approx = partial(hessian_approx,parameter,W,reference)
     else:
         _hessian_approx = None
-    _dynamics = partial(dynamics,parameter=parameter)
+    _dynamics = dynamics
     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics,x0)
     g, c = model_evaluator(X_in, U_in)
     dX,dU, dV, q, r = compute_search_direction(
