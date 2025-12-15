@@ -14,7 +14,8 @@ from .linalg_helpers import (
     invert_symmetric_positive_definite_matrix,
     project_psd_cone,
 )
-from .admm_tvlqr import constrained_solve, ADMMConfig
+from .admm_pcr import ADMMConfig, ADMMPCR, ADMMProblem
+from .admm_tvlqr import ADMMConfig, solve
 
 from .primal_tvlqr import tvlqr, tvlqr_gpu, rollout, rollout_gpu,non_linear_rollout, tvlqr_gpu_constrained, rollout_gpu_constrained,tvlqr_constrained
 import time
@@ -120,6 +121,65 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
+def solve_sqp_direction_with_admmpcr(
+    Q: jax.Array,   # (T+1, nx, nx)
+    q: jax.Array,   # (T+1, nx)
+    R: jax.Array,   # (T,   nu, nu)
+    r: jax.Array,   # (T,   nu)
+    M: jax.Array,   # (T,   nx, nu)
+    A: jax.Array,   # (T,   nx, nx)
+    B: jax.Array,   # (T,   nx, nu)
+    c: jax.Array,   # (T+1, nx)  where c[0] is initial defect, c[1:] stage defects
+):
+    T = R.shape[0]
+    nx = Q.shape[-1]
+    nu = R.shape[-1]
+
+    # ADMMPCR expects dynamics affine term c over stages 0..N-1
+    # with x_{t+1} = A_t x_t + B_t u_t + c_t
+    c_dyn = c[1:]          # (T, nx)
+    x0_dx = c[0]           # (nx,)
+
+    # No inequality constraints: nc=0, but keep array ranks consistent.
+    nc = 0
+    C = np.zeros((T + 1, nc, nx), dtype=Q.dtype)          # (T+1,0,nx)
+    D = np.zeros((T + 1, nc, nu), dtype=Q.dtype)          # (T+1,0,nu)
+    f = np.zeros((T + 1, nc, 1), dtype=Q.dtype)           # (T+1,0,1)
+
+    # NOTE: Your ADMMProblem stores stagewise (Q,q,R,r,A,B,c,C,D,f) and N,nx,nu,nc
+    prob = ADMMProblem(
+        Q=Q,
+        q=q,
+        R=R,
+        r=r,
+        A=A,
+        B=B,
+        c=c_dyn,
+        C=C,
+        D=D,
+        f=f,
+        N=T,
+        nx=nx,
+        nu=nu,
+        nc=nc,
+    )
+    config = ADMMConfig(
+        max_iterations=400,
+        rho_update_frequency=25,
+        condense_block_size=5,
+        eps_abs=1e-4,
+        eps_rel=1e-4,
+    )
+    solver = ADMMPCR(
+        config
+    )
+
+    # Important: inside a jitted outer loop, you typically cannot rely on solver internal warm-start state.
+    # If you want warm-starting, do it at the MPC loop level in Python (outside jit).
+    dX, dU = solver.solve(prob, x0_dx, warm_start=True)
+    jax.debug.print("du={}", dU)
+    return dX, dU
+
 @partial(jit, static_argnums=(0, 1, 2, 3))
 def compute_search_direction(
     cost,
@@ -131,7 +191,6 @@ def compute_search_direction(
     U,
     V,
     c,
-    w, y, rho,
 ):
     """Computes the SQP search direction.
 
@@ -179,47 +238,15 @@ def compute_search_direction(
         K, k, P, p = tvlqr(Q, q, R, r, M, A, B, c[1:])
         dX, dU = rollout(K, k, c[0], A, B, c[1:])
     else:
-        cfg = ADMMConfig(
-            eps_abs=1e-3,
-            eps_rel=1e-2
-        )
+        K, k, P, p = tvlqr_gpu(Q, q, R, r, M, A, B, c[1:])
+        dX, dU = rollout_gpu(K, k, c[0], A, B, c[1:])
+        dV = dual_lqr(dX, P, p)
+        # dX, dU = solve_sqp_direction_with_admmpcr(
+        #     Q, q, R, r, M, A, B, c
+        # )
+        # dV = np.zeros_like(V)
 
-        # Horizon sizes
-        T  = U.shape[0]          # dynamics stages
-        Tp1 = T + 1
-        nx = Q.shape[-1]
-        nu = R.shape[-1]
-
-        # Box on base x,y pose (state indices 0 and 1 in your setup)
-        px_idx, py_idx = 0, 1
-        bound = 1.0
-        m = 4  # (+px, -px, +py, -py)
-
-        # C for constraints on dX: shape (T+1, m, nx)
-        C0 = np.zeros((m, nx), dtype=X.dtype)
-        C0 = C0.at[0, px_idx].set( 1.0)  # +dpx
-        C0 = C0.at[1, px_idx].set(-1.0)  # -dpx
-        C0 = C0.at[2, py_idx].set( 1.0)  # +dpy
-        C0 = C0.at[3, py_idx].set(-1.0)  # -dpy
-        C = np.broadcast_to(C0, (Tp1, m, nx))
-
-        # No control dependence: shape (T+1, m, nu)
-        D = np.zeros((Tp1, m, nu), dtype=X.dtype)
-        jax.debug.print("{}", X[0, px_idx] )
-        # SQP-shifted RHS: constrain X_new = X + dX to lie in [-bound, bound]
-        px = X[:, px_idx]  # (T+1,)
-        py = X[:, py_idx]  # (T+1,)
-
-        # f[t] = [bound - px, bound + px, bound - py, bound + py]
-        f = np.stack([bound - px,
-                       bound + px,
-                       bound - py,
-                       bound + py], axis=1).astype(X.dtype)  # (T+1, m)
-
-        # Solve constrained QP for the SQP step (dX, dU)
-        dX, dU, dV, w, y, rho = constrained_solve(cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho)
-
-    return dX, dU, dV, q, r, w, y, rho
+    return dX, dU, dV, q, r
 @jit
 def merit_rho(c, dV):
     """Determines the merit function penalty parameter to be used.
@@ -651,9 +678,6 @@ def mpc(
     X_in,
     U_in,
     V_in,
-    w,
-    y,
-    rho,
     ):
 
     _cost = partial(cost,W,reference)
@@ -664,7 +688,7 @@ def mpc(
     _dynamics = partial(dynamics,parameter=parameter)
     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics,x0)
     g, c = model_evaluator(X_in, U_in)
-    dX,dU, dV, q, r, w, y, rho = compute_search_direction(
+    dX,dU, dV, q, r = compute_search_direction(
             _cost,
             _dynamics,
             _hessian_approx,
@@ -674,7 +698,6 @@ def mpc(
             U_in,
             V_in,
             c,
-            w, y, rho
         )
     # @jit
     # def merit_function(V, g, c, rho):
@@ -725,7 +748,7 @@ def mpc(
     U_new = U_in + dU
     V_new = V_in + dV
 
-    return X_new, U_new, V_new, w, y, rho
+    return X_new, U_new, V_new
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
 def al_mpc(
