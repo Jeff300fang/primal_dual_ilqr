@@ -4,7 +4,6 @@ import jax.numpy as jnp
 from jax import jit, lax, scipy, vmap
 from jax.tree_util import register_pytree_node_class
 
-
 @dataclass
 class ADMMConfig:
     rho_update_frequency: int = 25
@@ -41,7 +40,8 @@ class TVLQRCache:
 
     def tree_flatten(self):
         children = (self.BRinv, self.MRinv,
-                    self.Ginv, self.ArIClPr_inv, self.AlTIPrCl_inv)
+                    self.Ginv, self.ArIClPr_inv, self.AlTIPrCl_inv,
+                    )
         return children, None
 
     @classmethod
@@ -149,7 +149,6 @@ def tvlqr_gpu(Q, q, R, r, M, A, B, c):
                 P_new,
             ]
         )
-
     def chol_inv(t):
         f = scipy.linalg.cho_factor(R[t])
         m = R[t].shape[0]
@@ -206,6 +205,7 @@ def tvlqr_gpu(Q, q, R, r, M, A, B, c):
 
     result = lax.associative_scan(lambda r, l: vmap(fn)(r, l), elems, reverse=True)
 
+
     P = result[:, -n:, :]
     p = result[:, 2 * n + 1, :]
 
@@ -230,6 +230,50 @@ def tvlqr_gpu(Q, q, R, r, M, A, B, c):
     K, k = vmap(getKs)(jnp.arange(T))
 
     return K, k, P, p
+
+def _bridge_cache_from_scan(result, A_stage, C_stage):
+    """
+    result: (T+1, ?, ?) output of associative_scan (same layout as decompose)
+    A_stage: (T+1, n, n) the per-stage A blocks you placed into elems (last row can be zeros)
+    C_stage: (T+1, n, n) the per-stage C blocks you placed into elems (last row can be zeros)
+
+    Returns:
+      ArIClPr_inv: (T, n, n)
+      AlTIPrCl_inv: (T, n, n)
+    """
+    Tp1 = result.shape[0]
+    n = A_stage.shape[-1]
+    T = Tp1 - 1
+    I = jnp.eye(n, dtype=A_stage.dtype)
+
+    # Pull composed A(t..T) out of the scan result, same slot as A in `decompose`.
+    A_comp = result[:, :n, :]        # (T+1, n, n)
+
+    # Pull P(t) (you already do this)
+    P = result[:, -n:, :]            # (T+1, n, n)
+
+    # Left stage pieces at time t
+    Cl = C_stage[:T]                 # (T, n, n)
+    Al = A_stage[:T]                 # (T, n, n)
+
+    # Right composed tail pieces starting at t+1
+    Ar = A_comp[1:]                  # (T, n, n)  = composed A at index t+1
+    Pr = P[1:]                       # (T, n, n)  = P[t+1]
+
+    def ArI(Ar_, Cl_, Pr_):
+        # Ar_ @ inv(I + Cl_ @ Pr_)  computed as Ar_ @ solve(I + Cl_@Pr_, I)
+        S = I + Cl_ @ Pr_
+        return Ar_ @ jnp.linalg.solve(S, I)
+
+    def AlTI(Al_, Cl_, Pr_):
+        # Al_.T @ inv(I + Pr_ @ Cl_)
+        S = I + Pr_ @ Cl_
+        return Al_.T @ jnp.linalg.solve(S, I)
+
+    ArIClPr_inv = vmap(ArI)(Ar, Cl, Pr)      # (T, n, n)
+    AlTIPrCl_inv = vmap(AlTI)(Al, Cl, Pr)    # (T, n, n)
+
+    return ArIClPr_inv, AlTIPrCl_inv
 
 def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho):
     s_bar = w_bar - y_bar   
@@ -291,50 +335,6 @@ def adaptive_rho_update(rp_norm, rd_norm, rho,
                 jnp.where(dec, rho_dec, rho))
     updated = rho_new != rho
     return rho_new, updated
-
-def _bridge_cache_from_scan(result, A_stage, C_stage):
-    """
-    result: (T+1, ?, ?) output of associative_scan (same layout as decompose)
-    A_stage: (T+1, n, n) the per-stage A blocks you placed into elems (last row can be zeros)
-    C_stage: (T+1, n, n) the per-stage C blocks you placed into elems (last row can be zeros)
-
-    Returns:
-      ArIClPr_inv: (T, n, n)
-      AlTIPrCl_inv: (T, n, n)
-    """
-    Tp1 = result.shape[0]
-    n = A_stage.shape[-1]
-    T = Tp1 - 1
-    I = jnp.eye(n, dtype=A_stage.dtype)
-
-    # Pull composed A(t..T) out of the scan result, same slot as A in `decompose`.
-    A_comp = result[:, :n, :]        # (T+1, n, n)
-
-    # Pull P(t) (you already do this)
-    P = result[:, -n:, :]            # (T+1, n, n)
-
-    # Left stage pieces at time t
-    Cl = C_stage[:T]                 # (T, n, n)
-    Al = A_stage[:T]                 # (T, n, n)
-
-    # Right composed tail pieces starting at t+1
-    Ar = A_comp[1:]                  # (T, n, n)  = composed A at index t+1
-    Pr = P[1:]                       # (T, n, n)  = P[t+1]
-
-    def ArI(Ar_, Cl_, Pr_):
-        # Ar_ @ inv(I + Cl_ @ Pr_)  computed as Ar_ @ solve(I + Cl_@Pr_, I)
-        S = I + Cl_ @ Pr_
-        return Ar_ @ jnp.linalg.solve(S, I)
-
-    def AlTI(Al_, Cl_, Pr_):
-        # Al_.T @ inv(I + Pr_ @ Cl_)
-        S = I + Pr_ @ Cl_
-        return Al_.T @ jnp.linalg.solve(S, I)
-
-    ArIClPr_inv = vmap(ArI)(Ar, Cl, Pr)      # (T, n, n)
-    AlTIPrCl_inv = vmap(AlTI)(Al, Cl, Pr)    # (T, n, n)
-
-    return ArIClPr_inv, AlTIPrCl_inv
 
 def compute_Ginv(R, B, P):
     """
@@ -552,18 +552,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         it = carry[0]
         converged = carry[-1]
         return jnp.logical_and(it < cfg.max_iterations, jnp.logical_not(converged))
-
-    # def cond_fun(carry):
-    #     it = carry[0]
-    #     converged = carry[-1]
-    #     min_iters = 10
-    #     # keep iterating if:
-    #     #   - we have not reached max_iterations
-    #     #   - AND (we haven't reached min_iters OR we are not converged)
-    #     return jnp.logical_and(
-    #         it < cfg.max_iterations,
-    #         jnp.logical_or(it < min_iters, jnp.logical_not(converged))
-    #     )
     
     T = A.shape[0]
     m = C.shape[1]
@@ -610,3 +598,10 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
     return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final
 
+# Plan for Caching
+# 1. Replicate associative scan
+# 2. Make variable for keeping track of cached variables
+# 
+# Plan for using Cache
+# 1. Replicate associative scan
+# 2. Reference variable for cached information
