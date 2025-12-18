@@ -19,6 +19,28 @@ class ACPScanCache(NamedTuple):
     Cn:  jnp.ndarray
     Pn:  jnp.ndarray
 
+@dataclass
+class ADMMConfig:
+    rho_update_frequency: int = 25
+    max_iterations: int = 600
+    eps_abs: float = 1e-2
+    eps_rel: float = 1e-2
+    condense_block_size: int = 1
+
+@register_pytree_node_class
+@dataclass
+class ADMMWarmStart:
+    w: jnp.ndarray          # (T+1, m)
+    y: jnp.ndarray          # (T+1, m)
+    rho: jnp.ndarray  
+
+    def tree_flatten(self):
+        children = (self.w, self.y, self.rho)
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
 
 # -----------------------------
 # JAX combine for full TVLQR element (for reference comparison)
@@ -74,7 +96,6 @@ def _masked_write_level(cache, level, vals, mask):
     # cache[level, t] = vals[t] if mask[t] else 0
     m = mask.astype(vals.dtype)[:, None, None]
     return cache.at[level].set(vals * m)
-
 
 def _combine_acp_all(next_block, prev_block, n):
     """
@@ -242,30 +263,6 @@ def associative_scan_use_cache_cp_jax(c, p, T: int, cache: ACPScanCache, reverse
 
     return c_out, p_out
 
-
-@dataclass
-class ADMMConfig:
-    rho_update_frequency: int = 25
-    max_iterations: int = 10000
-    eps_abs: float = 1e-2
-    eps_rel: float = 1e-2
-    condense_block_size: int = 1
-
-@register_pytree_node_class
-@dataclass
-class ADMMWarmStart:
-    w: jnp.ndarray          # (T+1, m)
-    y: jnp.ndarray          # (T+1, m)
-    rho: jnp.ndarray  
-
-    def tree_flatten(self):
-        children = (self.w, self.y, self.rho)
-        return children, None
-
-    @classmethod
-    def tree_unflatten(cls, aux, children):
-        return cls(*children)
-
 @jit
 def dual_lqr(X, P, p):
     """Dual LQR solve.
@@ -308,146 +305,6 @@ def rollout_gpu(K, k, x0, A, B, c):
     U = vmap(lambda t: K[t] @ X[t] + k[t])(jnp.arange(T))
 
     return X, U
-
-@jit
-def tvlqr_gpu(Q, q, R, r, M, A, B, c):
-    """Discrete-time Finite Horizon Time-varying LQR.
-
-    This is a O(log T) parallel time complexity implementation, based on
-    https://ieeexplore.ieee.org/document/9697418.
-
-    Args:
-      Q: [T+1, n, n] numpy array.
-      q: [T+1, n]    numpy array.
-      R: [T, m, m]   numpy array.
-      r: [T, m]      numpy array.
-      M: [T, n, m]   numpy array.
-      A: [T, n, n]   numpy array.
-      B: [T, n, m]   numpy array.
-      c: [T, n]      numpy array.
-      delta: Enforces positive definiteness by ensuring smallest eigenval > delta.
-
-    Returns:
-      K: [T, m, n] Gains
-      k: [T, m] Affine terms (u_t = K[t] x_t + k[t])
-      P: [T+1, n, n] numpy array encoding initial value function.
-      p: [T+1, n] numpy array encoding initial value function.
-    """
-    T = Q.shape[0] - 1
-    n = Q.shape[1]
-
-    def fn(next, prev):
-        def decompose(elem):
-            return (
-                elem[:n],
-                elem[n],
-                elem[n + 1 : 2 * n + 1],
-                elem[2 * n + 1],
-                elem[-n:],
-            )
-
-        A_l, c_l, C_l, p_l, P_l = decompose(prev)
-        A_r, c_r, C_r, p_r, P_r = decompose(next)
-
-        ArIClPr_inv = A_r @ jnp.linalg.inv(jnp.eye(n) + C_l @ P_r)
-        AlTIPrCl_inv = A_l.T @ jnp.linalg.inv(jnp.eye(n) + P_r @ C_l)
-
-        A_new = ArIClPr_inv @ A_l
-        c_new = ArIClPr_inv @ (c_l - C_l @ p_r) + c_r
-        C_new = ArIClPr_inv @ C_l @ A_r.T + C_r
-        p_new = AlTIPrCl_inv @ (p_r + P_r @ c_l) + p_l
-        P_new = AlTIPrCl_inv @ P_r @ A_l + P_l
-
-        return jnp.concatenate(
-            [
-                A_new,
-                c_new.reshape(1, n),
-                C_new,
-                p_new.reshape(1, n),
-                P_new,
-            ]
-        )
-    def chol_inv(t):
-        f = scipy.linalg.cho_factor(R[t])
-        m = R[t].shape[0]
-        return scipy.linalg.cho_solve(f, jnp.eye(m))
-
-    Rinv = vmap(chol_inv)(jnp.arange(T))
-    BRinv = vmap(lambda t: B[t] @ Rinv[t])(jnp.arange(T))
-    MRinv = vmap(lambda t: M[t] @ Rinv[t])(jnp.arange(T))
-
-    elems = jnp.concatenate(
-        [
-            # The A matrices.
-            jnp.concatenate(
-                [
-                    A - vmap(lambda t: BRinv[t] @ M[t].T)(jnp.arange(T)),
-                    jnp.zeros([1, n, n]),
-                ]
-            ),
-            # The c vectors (b, in the notation of https://ieeexplore.ieee.org/document/9697418).
-            jnp.concatenate(
-                [
-                    (c - vmap(lambda t: BRinv[t] @ r[t])(jnp.arange(T))).reshape(
-                        [T, 1, n]
-                    ),
-                    jnp.zeros([1, 1, n]),
-                ]
-            ),
-            # The C matrices.
-            jnp.concatenate(
-                [
-                    vmap(lambda t: BRinv[t] @ B[t].T)(jnp.arange(T)),
-                    jnp.zeros([1, n, n]),
-                ]
-            ),
-            # The p vectors (-eta, in the notation of https://ieeexplore.ieee.org/document/9697418).
-            q.reshape([T + 1, 1, n])
-            - jnp.concatenate(
-                [
-                    vmap(lambda t: MRinv[t] @ r[t])(jnp.arange(T)).reshape([T, 1, n]),
-                    jnp.zeros([1, 1, n]),
-                ]
-            ),
-            # The P matrices (J, in the notation of https://ieeexplore.ieee.org/document/9697418).
-            Q
-            - jnp.concatenate(
-                [
-                    vmap(lambda t: MRinv[t] @ M[t].T)(jnp.arange(T)),
-                    jnp.zeros([1, n, n]),
-                ]
-            ),
-        ],
-        axis=1,
-    )
-
-    result = lax.associative_scan(lambda r, l: vmap(fn)(r, l), elems, reverse=True)
-
-
-    P = result[:, -n:, :]
-    p = result[:, 2 * n + 1, :]
-
-    def getKs(t):
-        # symmetrize = lambda x: 0.5 * (x + x.T)
-
-        BtP = B[t].T @ P[t + 1]
-        BtPA = BtP @ A[t]
-
-        H = BtPA + M[t].T
-        h = B[t].T @ p[t + 1] + BtP @ c[t] + r[t]
-
-        # G = symmetrize(R[t] + BtP @ B[t])
-
-        # f = scipy.linalg.cho_factor(G)
-        K_k = scipy.linalg.solve(R[t] + BtP @ B[t], -jnp.hstack((H, h.reshape([-1, 1]))))
-        K = K_k[:, :-1]
-        k = K_k[:, -1]
-
-        return K, k
-
-    K, k = vmap(getKs)(jnp.arange(T))
-
-    return K, k, P, p
 
 def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho):
     s_bar = w_bar - y_bar   
@@ -611,12 +468,11 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     # --- one ADMM iteration ---
     def one_iter(carry):
         (it, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, 
-         x_bar, u_bar, _, y_bar, v, w_prev, rho, cache, BRinv, MRinv, P, K,
-         rp_norm, rd_norm, eps_pri, eps_dual, _) = carry
+         x_bar, u_bar, y_bar, w_prev, rho, cache, BRinv, MRinv, P, _, K,
+         _, _, _, _, _) = carry
 
 
         # -------- Solve unconstrained LQR subproblem --------
-        # K_true, k_true, P_true, p_true = tvlqr_gpu(tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, A, B, c[1:])
         T = Q.shape[0] - 1
         n = Q.shape[1]
         c0, p0 = generate_leaf_bp(c[1:], BRinv, MRinv, tilde_r, tilde_q, T, n)
@@ -624,9 +480,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         k = get_k(tilde_R, tilde_r, B, P, p, c[1:])
 
         x_bar, u_stage = rollout_gpu(K, k, c[0], A, B, c[1:])
-        # x_bar, u_stage = rollout_gpu(K_true, k_true, c[0], A, B, c[1:])
         u_bar = jnp.pad(u_stage, ((0, 1), (0, 0)))  # (T+1, nu)
-        v = dual_lqr(x_bar, P, p)
 
         # z = Cx + Du
         z_bar = (
@@ -688,8 +542,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         rho_new, y_new, rho_updated = lax.cond(do_rho_update, update_fn, no_update_fn, operand=None)
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, cache_new, BRinv, MRinv, P, K = lax.cond(rho_updated, cache_update, no_cache_update, operand=None)
 
-        return (it + 1, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, x_bar, u_bar, w_new, y_new, v, w_new,
-                rho_new, cache_new, BRinv, MRinv, P, K,
+        return (it + 1, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, x_bar, u_bar, y_new, w_new,
+                rho_new, cache_new, BRinv, MRinv, P, p, K,
                 rp_norm, rd_norm, eps_pri, eps_dual, converged)
 
     # --- loop condition: keep going until max_iters OR converged ---
@@ -712,7 +566,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     init_w = w
     init_y = y
     rho0 = rho
-    init_v = jnp.zeros((T + 1, nx), dtype=Q.dtype)
+    p_init = jnp.zeros((T + 1, nx), dtype=Q.dtype)
     tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M = admm_augment_xu(
         Q, q, R, r, M, C, D, init_w, init_y, rho0
     )
@@ -723,10 +577,9 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     init = (
         jnp.array(1, dtype=jnp.int32),  # it
         tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M,
-        init_x, init_u, init_w, init_y, init_v,
-        init_w,                          # w_prev
+        init_x, init_u, init_y, init_w,                          
         jnp.array(rho0, dtype=Q.dtype),  # rho
-        cache, BRinv, MRinv, P, K,
+        cache, BRinv, MRinv, P, p_init, K,
         jnp.array(jnp.inf, dtype=Q.dtype),  # rp_norm
         jnp.array(jnp.inf, dtype=Q.dtype),  # rd_norm
         jnp.array(jnp.inf, dtype=Q.dtype),  # eps_pri
@@ -736,9 +589,9 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
     out = jax.lax.while_loop(cond_fun, one_iter, init)
 
-    it, _, _, _, _, _, x_bar, u_bar, w_bar, y_bar, v, _, rho_final, _, _, _, _, _, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
+    it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, _, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
 
-    # If you want logging, print once at the end (safe in jit)
+    v = dual_lqr(x_bar, P_final, p_final)
     jax.debug.print(
         "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e})",
         it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual
