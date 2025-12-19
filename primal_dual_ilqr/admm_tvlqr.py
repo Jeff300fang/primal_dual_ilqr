@@ -22,7 +22,7 @@ class ACPScanCache(NamedTuple):
 @dataclass
 class ADMMConfig:
     rho_update_frequency: int = 25
-    max_iterations: int = 600
+    max_iterations: int = 1000
     eps_abs: float = 1e-2
     eps_rel: float = 1e-2
     condense_block_size: int = 1
@@ -60,8 +60,25 @@ def fn_full(next_elem, prev_elem):
     p_r = next_elem[2 * n + 1, :]
     P_r = next_elem[-n:, :]
 
-    Ar = A_r @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + C_l @ P_r)
-    Al = A_l.T @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + P_r @ C_l)
+    # Ar = A_r @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + C_l @ P_r)
+    # Al = A_l.T @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + P_r @ C_l)
+    
+    # Not sure why but the above is just more stable
+    I = jnp.eye(n, dtype=prev_elem.dtype)    
+    M1 = I + C_l @ P_r
+    M2 = I + P_r @ C_l
+
+    reg = 1e-8
+    M1 = M1 + reg * I
+    M2 = M2 + reg * I
+
+    Ar = jnp.linalg.solve(M1.T, A_r.T).T      # solves X M1 = A_r
+    Al = jnp.linalg.solve(M2.T, A_l).T  
+    # L1 = jnp.linalg.cholesky(M1)
+    # Ar = jax.scipy.linalg.cho_solve((L1, True), A_r.T).T
+
+    # L2 = jnp.linalg.cholesky(M2)
+    # Al = jax.scipy.linalg.cho_solve((L2, True), A_l).T
 
     A_new = Ar @ A_l
     c_new = Ar @ (c_l - C_l @ p_r) + c_r
@@ -354,18 +371,27 @@ def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
     return r_norm, s_norm, eps_pri, eps_dual
 
 def adaptive_rho_update(rp_norm, rd_norm, rho,
-                        mu=10.0, tau_inc=2.0, tau_dec=2.0,
-                        rho_min=1e-2, rho_max=1e6):
-    inc = rp_norm > mu * rd_norm
-    dec = rd_norm > mu * rp_norm
+                        clip_min=0.2, clip_max=5,
+                        rho_min=1e-2, rho_max=1e5,
+                        eps=1e-12):
+    """
+    Adaptive rho update using residual ratio directly as scaling,
+    clipped to a bounded range.
+    """
 
-    rho_inc = jnp.minimum(rho * tau_inc, rho_max)
-    rho_dec = jnp.maximum(rho / tau_dec, rho_min)
+    # Residual ratio as scaling factor
+    scale = rp_norm / (rd_norm + eps)
 
-    rho_new = jnp.where(inc, rho_inc,
-                jnp.where(dec, rho_dec, rho))
+    # Clip scaling factor
+    scale = jnp.clip(scale, clip_min, clip_max)
+
+    # Update rho with hard bounds
+    rho_new = jnp.clip(rho * scale, rho_min, rho_max)
+
     updated = rho_new != rho
     return rho_new, updated
+
+
 
 def compute_Ginv(R, B, P):
     """
@@ -395,9 +421,14 @@ def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B):
     T = tilde_Q.shape[0] - 1
     n = tilde_Q.shape[1]
     def chol_inv(t):
-        f = scipy.linalg.cho_factor(tilde_R[t])
-        m = tilde_R[t].shape[0]
-        return scipy.linalg.cho_solve(f, jnp.eye(m))
+        Rt = 0.5 * (tilde_R[t] + tilde_R[t].T)
+        Rt = Rt + 1e-8 * jnp.eye(Rt.shape[0], dtype=Rt.dtype)
+        I = jnp.eye(tilde_R[t].shape[0])
+        Rinv = jnp.linalg.solve(Rt, I)
+        return Rinv
+        # f = scipy.linalg.cho_factor(tilde_R[t])
+        # m = tilde_R[t].shape[0]
+        # return scipy.linalg.cho_solve(f, jnp.eye(m))
 
     Rinv = vmap(chol_inv)(jnp.arange(T))
     BRinv = vmap(lambda t: B[t] @ Rinv[t])(jnp.arange(T))
@@ -593,8 +624,8 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
 
     v = dual_lqr(x_bar, P_final, p_final)
     jax.debug.print(
-        "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e})",
-        it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual
+        "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
+        it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
     )
 
-    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final
+    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, converged

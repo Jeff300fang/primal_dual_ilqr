@@ -175,51 +175,72 @@ def compute_search_direction(
     A = A_pad[:-1]
     B = B_pad[:-1]
 
-    if limited_memory:
-        K, k, P, p = tvlqr(Q, q, R, r, M, A, B, c[1:])
-        dX, dU = rollout(K, k, c[0], A, B, c[1:])
-    else:
-        cfg = ADMMConfig(
-            eps_abs=1e-3,
-            eps_rel=1e-2
+    cfg = ADMMConfig(
+        eps_abs=1e-3,
+        eps_rel=1e-2
+    )
+
+    # Horizon sizes
+    T  = U.shape[0]          # dynamics stages
+    Tp1 = T + 1
+    nx = Q.shape[-1]
+    nu = R.shape[-1]
+
+    # Box on base x,y pose (state indices 0 and 1 in your setup)
+    px_idx, py_idx = 0, 1
+    bound = 1.0
+    m = 4  # (+px, -px, +py, -py)
+
+    # C for constraints on dX: shape (T+1, m, nx)
+    C0 = np.zeros((m, nx), dtype=X.dtype)
+    C0 = C0.at[0, px_idx].set( 1.0)  # +dpx
+    C0 = C0.at[1, px_idx].set(-1.0)  # -dpx
+    C0 = C0.at[2, py_idx].set( 1.0)  # +dpy
+    C0 = C0.at[3, py_idx].set(-1.0)  # -dpy
+    C = np.broadcast_to(C0, (Tp1, m, nx))
+
+    # No control dependence: shape (T+1, m, nu)
+    D = np.zeros((Tp1, m, nu), dtype=X.dtype)
+    jax.debug.print("{}", X[0, px_idx] )
+    # SQP-shifted RHS: constrain X_new = X + dX to lie in [-bound, bound]
+    px = X[:, px_idx]  # (T+1,)
+    py = X[:, py_idx]  # (T+1,)
+
+    # f[t] = [bound - px, bound + px, bound - py, bound + py]
+    f = np.stack([bound - px,
+                    bound + px,
+                    bound - py,
+                    bound + py], axis=1).astype(X.dtype)  # (T+1, m)
+
+    # Solve constrained QP for the SQP step (dX, dU)
+    dX, dU, dV, w, y, rho, converged = constrained_solve(
+        cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
+    )
+    def converged_branch(state):
+        # state = (w, y, rho)
+        return dX, dU, dV, state[0], state[1], state[2], converged
+
+    def not_converged_branch(state):
+        jax.debug.print("Failed first solve, resolving from clean start")
+        w0, y0, rho0 = state
+        w_init = np.zeros_like(w0)
+        y_init = np.zeros_like(y0)
+        rho_init = np.asarray(0.1, dtype=rho0.dtype)
+
+        dX2, dU2, dV2, w2, y2, rho2, conv2 = constrained_solve(
+            cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
         )
+        return dX2, dU2, dV2, w2, y2, rho2, conv2
 
-        # Horizon sizes
-        T  = U.shape[0]          # dynamics stages
-        Tp1 = T + 1
-        nx = Q.shape[-1]
-        nu = R.shape[-1]
-
-        # Box on base x,y pose (state indices 0 and 1 in your setup)
-        px_idx, py_idx = 0, 1
-        bound = 1.0
-        m = 4  # (+px, -px, +py, -py)
-
-        # C for constraints on dX: shape (T+1, m, nx)
-        C0 = np.zeros((m, nx), dtype=X.dtype)
-        C0 = C0.at[0, px_idx].set( 1.0)  # +dpx
-        C0 = C0.at[1, px_idx].set(-1.0)  # -dpx
-        C0 = C0.at[2, py_idx].set( 1.0)  # +dpy
-        C0 = C0.at[3, py_idx].set(-1.0)  # -dpy
-        C = np.broadcast_to(C0, (Tp1, m, nx))
-
-        # No control dependence: shape (T+1, m, nu)
-        D = np.zeros((Tp1, m, nu), dtype=X.dtype)
-        jax.debug.print("{}", X[0, px_idx] )
-        # SQP-shifted RHS: constrain X_new = X + dX to lie in [-bound, bound]
-        px = X[:, px_idx]  # (T+1,)
-        py = X[:, py_idx]  # (T+1,)
-
-        # f[t] = [bound - px, bound + px, bound - py, bound + py]
-        f = np.stack([bound - px,
-                       bound + px,
-                       bound - py,
-                       bound + py], axis=1).astype(X.dtype)  # (T+1, m)
-
-        # Solve constrained QP for the SQP step (dX, dU)
-        dX, dU, dV, w, y, rho = constrained_solve(cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho)
+    dX, dU, dV, w, y, rho, converged = lax.cond(
+        converged,
+        converged_branch,
+        not_converged_branch,
+        operand=(w, y, rho),
+    )
 
     return dX, dU, dV, q, r, w, y, rho
+
 @jit
 def merit_rho(c, dV):
     """Determines the merit function penalty parameter to be used.
