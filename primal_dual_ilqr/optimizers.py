@@ -4,19 +4,9 @@ import jax.numpy as np
 
 from functools import partial
 
-from trajax.optimizers import evaluate, linearize, quadratize,vectorize
+from trajax.optimizers import linearize, quadratize,vectorize
 
-from .kkt_helpers import compute_search_direction_kkt, tvlqr_kkt
-
-from .dual_tvlqr import dual_lqr, dual_lqr_backward, dual_lqr_gpu,dual_lqr_backward_constrained
-
-from .linalg_helpers import (
-    invert_symmetric_positive_definite_matrix,
-    project_psd_cone,
-)
 from .admm_tvlqr import constrained_solve, ADMMConfig
-
-from .primal_tvlqr import tvlqr, tvlqr_gpu, rollout, rollout_gpu,non_linear_rollout, tvlqr_gpu_constrained, rollout_gpu_constrained,tvlqr_constrained
 import time
 
 def linearize_scan(fun, argnums=3):
@@ -120,6 +110,7 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
+
 @partial(jit, static_argnums=(0, 1, 2, 3))
 def compute_search_direction(
     cost,
@@ -176,41 +167,93 @@ def compute_search_direction(
     B = B_pad[:-1]
 
     cfg = ADMMConfig(
-        eps_abs=1e-3,
+        eps_abs=1e-2,
         eps_rel=1e-2
     )
 
     # Horizon sizes
-    T  = U.shape[0]          # dynamics stages
+       # Horizon sizes
+    T  = U.shape[0]
     Tp1 = T + 1
     nx = Q.shape[-1]
     nu = R.shape[-1]
 
-    # Box on base x,y pose (state indices 0 and 1 in your setup)
+    # Indices for position in state
     px_idx, py_idx = 0, 1
-    bound = 1.0
-    m = 4  # (+px, -px, +py, -py)
 
-    # C for constraints on dX: shape (T+1, m, nx)
-    C0 = np.zeros((m, nx), dtype=X.dtype)
-    C0 = C0.at[0, px_idx].set( 1.0)  # +dpx
-    C0 = C0.at[1, px_idx].set(-1.0)  # -dpx
-    C0 = C0.at[2, py_idx].set( 1.0)  # +dpy
-    C0 = C0.at[3, py_idx].set(-1.0)  # -dpy
-    C = np.broadcast_to(C0, (Tp1, m, nx))
+    # ---------- Outside-circle constraint ONLY ----------
+    # Circle: center (3, 0), radius 1
+    # cx = np.asarray(2.0, dtype=X.dtype)
+    # cy = np.asarray(0.1, dtype=X.dtype)
+    # rad = np.asarray(0.41, dtype=X.dtype)
 
-    # No control dependence: shape (T+1, m, nu)
-    D = np.zeros((Tp1, m, nu), dtype=X.dtype)
-    jax.debug.print("{}", X[0, px_idx] )
-    # SQP-shifted RHS: constrain X_new = X + dX to lie in [-bound, bound]
+    # px = X[:, px_idx]  # (T+1,)
+    # py = X[:, py_idx]  # (T+1,)
+
+    # dx = px - cx
+    # dy = py - cy
+
+    # # Linearized inequality for "outside circle":
+    # #   ||p|| outside => r^2 - ||p-c||^2 <= 0
+    # # Linearization gives:
+    # #   -2*dx*dpx - 2*dy*dpy <= (dx^2 + dy^2) - r^2
+    # m = 1  # one inequality per time step
+
+    # C = np.zeros((Tp1, m, nx), dtype=X.dtype)
+    # C = C.at[:, 0, px_idx].set(-2.0 * dx)
+    # C = C.at[:, 0, py_idx].set(-2.0 * dy)
+
+    # f = ((dx * dx + dy * dy) - (rad * rad))[:, None].astype(X.dtype)  # (T+1, 1)
+
+    # # No control dependence
+    # D = np.zeros((Tp1, m, nu), dtype=X.dtype)
+
+    # jax.debug.print("X = {} Y = {}", X[0, px_idx], X[0, py_idx])
+    # jax.debug.print("{}", ((X[0, px_idx] - 2.0)**2 + (X[0, py_idx]-0.1)**2)**0.5)
+    # ---------- Outside-circle constraints (two circles) ----------
+    # Same radius/type as before. Centers: (2.0, 0.1) and (4.0, 0.0)
+    cx1 = np.asarray(2.0, dtype=X.dtype)
+    cy1 = np.asarray(0.1, dtype=X.dtype)
+
+    cx2 = np.asarray(4.0, dtype=X.dtype)
+    cy2 = np.asarray(0.15, dtype=X.dtype)
+
+    rad = np.asarray(0.41, dtype=X.dtype)
+
     px = X[:, px_idx]  # (T+1,)
     py = X[:, py_idx]  # (T+1,)
 
-    # f[t] = [bound - px, bound + px, bound - py, bound + py]
-    f = np.stack([bound - px,
-                    bound + px,
-                    bound - py,
-                    bound + py], axis=1).astype(X.dtype)  # (T+1, m)
+    # circle 1 deltas
+    dx1 = px - cx1
+    dy1 = py - cy1
+
+    # circle 2 deltas
+    dx2 = px - cx2
+    dy2 = py - cy2
+
+    # Two inequalities per time step
+    m = 2
+
+    C = np.zeros((Tp1, m, nx), dtype=X.dtype)
+    # Circle 1 gradient row
+    C = C.at[:, 0, px_idx].set(-2.0 * dx1)
+    C = C.at[:, 0, py_idx].set(-2.0 * dy1)
+    # Circle 2 gradient row
+    C = C.at[:, 1, px_idx].set(-2.0 * dx2)
+    C = C.at[:, 1, py_idx].set(-2.0 * dy2)
+
+    # RHS for each inequality row
+    f1 = (dx1 * dx1 + dy1 * dy1) - (rad * rad)   # (T+1,)
+    f2 = (dx2 * dx2 + dy2 * dy2) - (rad * rad)   # (T+1,)
+    f = np.stack([f1, f2], axis=1).astype(X.dtype)  # (T+1, 2)
+
+    # No control dependence
+    D = np.zeros((Tp1, m, nu), dtype=X.dtype)
+
+    # Optional debug prints
+    jax.debug.print("p0 = ({}, {})", X[0, px_idx], X[0, py_idx])
+    jax.debug.print("dist to circle1 center = {}", np.sqrt((X[0, px_idx]-cx1)**2 + (X[0, py_idx]-cy1)**2))
+    jax.debug.print("dist to circle2 center = {}", np.sqrt((X[0, px_idx]-cx2)**2 + (X[0, py_idx]-cy2)**2))
 
     # Solve constrained QP for the SQP step (dX, dU)
     dX, dU, dV, w, y, rho, converged = constrained_solve(
@@ -221,7 +264,7 @@ def compute_search_direction(
         return dX, dU, dV, state[0], state[1], state[2], converged
 
     def not_converged_branch(state):
-        jax.debug.print("Failed first solve, resolving from clean start")
+        # jax.debug.print("Failed first solve, resolving from clean start")
         w0, y0, rho0 = state
         w_init = np.zeros_like(w0)
         y_init = np.zeros_like(y0)

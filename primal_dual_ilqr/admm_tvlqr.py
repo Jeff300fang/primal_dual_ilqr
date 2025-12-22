@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 from jax import jit, lax, scipy, vmap
 from jax.tree_util import register_pytree_node_class
-# from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_associative_scan import associative_scan_cache_acp_jax, associative_scan_use_cache_cp_jax
 from typing import NamedTuple
 import math
 from functools import partial
@@ -22,7 +21,7 @@ class ACPScanCache(NamedTuple):
 @dataclass
 class ADMMConfig:
     rho_update_frequency: int = 25
-    max_iterations: int = 1000
+    max_iterations: int = 400
     eps_abs: float = 1e-2
     eps_rel: float = 1e-2
     condense_block_size: int = 1
@@ -365,7 +364,7 @@ def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
     w_norm = jnp.linalg.norm(w.reshape(-1), ord=2)
     y_norm = jnp.linalg.norm(y.reshape(-1), ord=2)
 
-    eps_pri = jnp.sqrt(n) * eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
+    eps_pri = jnp.sqrt(n) * eps_abs + eps_rel * z_norm
     eps_dual = jnp.sqrt(n) * eps_abs + eps_rel * (rho * y_norm)
 
     return r_norm, s_norm, eps_pri, eps_dual
@@ -390,8 +389,6 @@ def adaptive_rho_update(rp_norm, rd_norm, rho,
 
     updated = rho_new != rho
     return rho_new, updated
-
-
 
 def compute_Ginv(R, B, P):
     """
@@ -463,7 +460,6 @@ def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B):
     )
 
     return elems, BRinv, MRinv
-
 def generate_leaf_bp(c, BRinv, MRinv, tilde_r, tilde_q, T, n):
     # c: (T, n)   where this is c[1:] in your caller
     # tilde_q: (T+1, n)
