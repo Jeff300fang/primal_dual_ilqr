@@ -1,6 +1,6 @@
 from jax import debug, grad, jit, lax, scipy, vmap
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 
 from functools import partial
 
@@ -29,7 +29,7 @@ def linearize_scan(fun, argnums=3):
             where,
               X is [T+1, n] state trajectory,
               U is [T, m] control sequence (pad(U) pads a 0 row for convenience),
-              timesteps is typically np.arange(T+1)
+              timesteps is typically jnp.arange(T+1)
 
               and A, B are Dynamics Jacobians wrt state (x) and control (u) of
               shape [T+1, n, n] and [T+1, n, m] respectively;
@@ -74,7 +74,7 @@ def linearize_obj_scan(fun, argnums=5):
             where,
               X is [T+1, n] state trajectory,
               U is [T, m] control sequence (pad(U) pads a 0 row for convenience),
-              timesteps is typically np.arange(T+1)
+              timesteps is typically jnp.arange(T+1)
 
               and A, B are Dynamics Jacobians wrt state (x) and control (u) of
               shape [T+1, n, n] and [T+1, n, m] respectively;
@@ -104,19 +104,50 @@ def lagrangian(cost, dynamics, x0):
 
     def fun(x, u, t, v, v_prev):
         c1 = cost(x, u, t)
-        c2 = np.dot(v, dynamics(x, u, t))
-        c3 = np.dot(v_prev, lax.select(t == 0, x0 - x, -x))
+        c2 = jnp.dot(v, dynamics(x, u, t))
+        c3 = jnp.dot(v_prev, lax.select(t == 0, x0 - x, -x))
         return c1 + c2 + c3
 
     return fun
 
+def linearize_constraints(Xk, Uk, constraint):
+    T   = Uk.shape[0]
+    Tp1 = T + 1
+    nx  = Xk.shape[1]
+    nu  = Uk.shape[1]
 
-@partial(jit, static_argnums=(0, 1, 2, 3))
+    g0_flat = constraint(Xk, Uk).reshape(-1)
+    m = g0_flat.size // Tp1
+    g0 = g0_flat.reshape(Tp1, m)
+
+    JX_flat, JU_flat = jax.jacrev(constraint, argnums=(0, 1))(Xk, Uk)
+
+    # Reshape to (t_out, m, t_in, nx/nu)
+    JX = JX_flat.reshape(Tp1, m, Tp1, nx)
+    JU = JU_flat.reshape(Tp1, m, T,  nu)
+
+    # C[t] = d g_t / d x_t
+    C = JX[jnp.arange(Tp1), :, jnp.arange(Tp1), :]          # (T+1, m, nx)
+
+    # D[t] = d g_t / d u_t for t=0..T-1
+    D_body = JU[jnp.arange(T), :, jnp.arange(T), :]         # (T, m, nu)
+
+    # Append zeros for t=T
+    D_last = jnp.zeros((1, m, nu), dtype=Xk.dtype)
+    D = jnp.concatenate([D_body, D_last], axis=0)           # (T+1, m, nu)
+
+    f = -g0                                                 # (T+1, m)
+    return C, D, f
+
+
+
+@partial(jit, static_argnums=(0, 1, 2, 3, 4))
 def compute_search_direction(
     cost,
     dynamics,
     hessian_approx,
     limited_memory,
+    constraints,
     x0,
     X,
     U,
@@ -145,13 +176,13 @@ def compute_search_direction(
     """
     T = U.shape[0]
 
-    pad = lambda A: np.pad(A, [[0, 1], [0, 0]])
+    pad = lambda A: jnp.pad(A, [[0, 1], [0, 0]])
 
     if hessian_approx is None:
         quadratizer = quadratize(cost)
-        Q, R_pad, M_pad = quadratizer(X, pad(U), np.arange(T + 1))
+        Q, R_pad, M_pad = quadratizer(X, pad(U), jnp.arange(T + 1))
     else:
-        Q, R_pad, M_pad = jax.vmap(hessian_approx)(X, pad(U), np.arange(T + 1))
+        Q, R_pad, M_pad = jax.vmap(hessian_approx)(X, pad(U), jnp.arange(T + 1))
 
     R = R_pad[:-1]
     M = M_pad[:-1]
@@ -159,101 +190,26 @@ def compute_search_direction(
     linearizer = linearize(lagrangian(cost, dynamics, x0),argnums = 5)
     dynamics_linearizer = linearize(dynamics)
 
-    q, r_pad = linearizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
+    q, r_pad = linearizer(X, pad(U), jnp.arange(T + 1), pad(V[1:]), V)
     r = r_pad[:-1]
 
-    A_pad, B_pad = dynamics_linearizer(X, pad(U), np.arange(T + 1))
+    A_pad, B_pad = dynamics_linearizer(X, pad(U), jnp.arange(T + 1))
     A = A_pad[:-1]
     B = B_pad[:-1]
+
+    start = time.perf_counter()
+    C, D, f = linearize_constraints(X, U, constraints)
+    end = time.perf_counter()
+    jax.debug.print("{}", end - start)
 
     cfg = ADMMConfig(
         eps_abs=1e-2,
         eps_rel=1e-2
     )
 
-    # Horizon sizes
-       # Horizon sizes
-    T  = U.shape[0]
-    Tp1 = T + 1
-    nx = Q.shape[-1]
-    nu = R.shape[-1]
-
     # Indices for position in state
     px_idx, py_idx = 0, 1
-
-    # ---------- Outside-circle constraint ONLY ----------
-    # Circle: center (3, 0), radius 1
-    # cx = np.asarray(2.0, dtype=X.dtype)
-    # cy = np.asarray(0.1, dtype=X.dtype)
-    # rad = np.asarray(0.41, dtype=X.dtype)
-
-    # px = X[:, px_idx]  # (T+1,)
-    # py = X[:, py_idx]  # (T+1,)
-
-    # dx = px - cx
-    # dy = py - cy
-
-    # # Linearized inequality for "outside circle":
-    # #   ||p|| outside => r^2 - ||p-c||^2 <= 0
-    # # Linearization gives:
-    # #   -2*dx*dpx - 2*dy*dpy <= (dx^2 + dy^2) - r^2
-    # m = 1  # one inequality per time step
-
-    # C = np.zeros((Tp1, m, nx), dtype=X.dtype)
-    # C = C.at[:, 0, px_idx].set(-2.0 * dx)
-    # C = C.at[:, 0, py_idx].set(-2.0 * dy)
-
-    # f = ((dx * dx + dy * dy) - (rad * rad))[:, None].astype(X.dtype)  # (T+1, 1)
-
-    # # No control dependence
-    # D = np.zeros((Tp1, m, nu), dtype=X.dtype)
-
-    # jax.debug.print("X = {} Y = {}", X[0, px_idx], X[0, py_idx])
-    # jax.debug.print("{}", ((X[0, px_idx] - 2.0)**2 + (X[0, py_idx]-0.1)**2)**0.5)
-    # ---------- Outside-circle constraints (two circles) ----------
-    # Same radius/type as before. Centers: (2.0, 0.1) and (4.0, 0.0)
-    cx1 = np.asarray(2.0, dtype=X.dtype)
-    cy1 = np.asarray(0.1, dtype=X.dtype)
-
-    cx2 = np.asarray(4.0, dtype=X.dtype)
-    cy2 = np.asarray(0.15, dtype=X.dtype)
-
-    rad = np.asarray(0.41, dtype=X.dtype)
-
-    px = X[:, px_idx]  # (T+1,)
-    py = X[:, py_idx]  # (T+1,)
-
-    # circle 1 deltas
-    dx1 = px - cx1
-    dy1 = py - cy1
-
-    # circle 2 deltas
-    dx2 = px - cx2
-    dy2 = py - cy2
-
-    # Two inequalities per time step
-    m = 2
-
-    C = np.zeros((Tp1, m, nx), dtype=X.dtype)
-    # Circle 1 gradient row
-    C = C.at[:, 0, px_idx].set(-2.0 * dx1)
-    C = C.at[:, 0, py_idx].set(-2.0 * dy1)
-    # Circle 2 gradient row
-    C = C.at[:, 1, px_idx].set(-2.0 * dx2)
-    C = C.at[:, 1, py_idx].set(-2.0 * dy2)
-
-    # RHS for each inequality row
-    f1 = (dx1 * dx1 + dy1 * dy1) - (rad * rad)   # (T+1,)
-    f2 = (dx2 * dx2 + dy2 * dy2) - (rad * rad)   # (T+1,)
-    f = np.stack([f1, f2], axis=1).astype(X.dtype)  # (T+1, 2)
-
-    # No control dependence
-    D = np.zeros((Tp1, m, nu), dtype=X.dtype)
-
-    # Optional debug prints
     jax.debug.print("p0 = ({}, {})", X[0, px_idx], X[0, py_idx])
-    jax.debug.print("dist to circle1 center = {}", np.sqrt((X[0, px_idx]-cx1)**2 + (X[0, py_idx]-cy1)**2))
-    jax.debug.print("dist to circle2 center = {}", np.sqrt((X[0, px_idx]-cx2)**2 + (X[0, py_idx]-cy2)**2))
 
     # Solve constrained QP for the SQP step (dX, dU)
     dX, dU, dV, w, y, rho, converged = constrained_solve(
@@ -266,9 +222,9 @@ def compute_search_direction(
     def not_converged_branch(state):
         # jax.debug.print("Failed first solve, resolving from clean start")
         w0, y0, rho0 = state
-        w_init = np.zeros_like(w0)
-        y_init = np.zeros_like(y0)
-        rho_init = np.asarray(0.1, dtype=rho0.dtype)
+        w_init = jnp.zeros_like(w0)
+        y_init = jnp.zeros_like(y0)
+        rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
 
         dX2, dU2, dV2, w2, y2, rho2, conv2 = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
@@ -295,9 +251,9 @@ def merit_rho(c, dV):
     Returns:
         rho: the penalty parameter.
     """
-    c2 = np.sum(c * c)
-    dV2 = np.sum(dV * dV)
-    return lax.select(c2 > 1e-12, 2.0 * np.sqrt(dV2 / c2), 1e-2)
+    c2 = jnp.sum(c * c)
+    dV2 = jnp.sum(dV * dV)
+    return lax.select(c2 > 1e-12, 2.0 * jnp.sqrt(dV2 / c2), 1e-2)
 
 
 @jit
@@ -316,7 +272,7 @@ def slope(dX, dU, dV, c, q, r, rho):
     Returns:
         dir_derivative: the directional derivative.
     """
-    return np.sum(q * dX) + np.sum(r * dU) + 2*np.sum(dV * c) - rho * np.sum(c * c)
+    return jnp.sum(q * dX) + jnp.sum(r * dU) + 2*jnp.sum(dV * c) - rho * jnp.sum(c * c)
 
 @partial(jit, static_argnums=(0, 1))
 def line_search(
@@ -368,7 +324,7 @@ def line_search(
     def continuation_criterion(inputs):
         _, _, _, _, _, new_merit, alpha = inputs
         # debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")\
-        return np.logical_and(
+        return jnp.logical_and(
             new_merit > current_merit + alpha * armijo_factor * merit_slope,
             alpha > alpha_min,
         )
@@ -381,13 +337,13 @@ def line_search(
         V_new = V_in + alpha * dV
         new_g, new_c = model_evaluator(X_new, U_new)
         new_merit = merit_function(V_new, new_g, new_c)
-        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
+        new_merit = jnp.where(jnp.isnan(new_merit), current_merit, new_merit)
         return X_new, U_new, V_new, new_g, new_c, new_merit, alpha
 
     X, U, V, new_g, new_c, new_merit, alpha = lax.while_loop(
         continuation_criterion,
         body,
-        (X_in, U_in, V_in, current_g, current_c, np.inf, alpha_0 / alpha_mult),
+        (X_in, U_in, V_in, current_g, current_c, jnp.inf, alpha_0 / alpha_mult),
     )
     no_errors = alpha > alpha_min
 
@@ -440,19 +396,19 @@ def parallel_line_search(
     """
     def step_acceptance(merit,alpha):
         return merit > current_merit + alpha * armijo_factor * merit_slope
-    alpha_values = np.exp2(-np.arange(11))
+    alpha_values = jnp.exp2(-jnp.arange(11))
     def body(alpha):
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
         V_new = V_in + alpha * dV
         new_g, new_c = model_evaluator(X_new, U_new) #this cam br probly avoided
         new_merit = merit_function(V_new, new_g, new_c)
-        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
+        new_merit = jnp.where(jnp.isnan(new_merit), current_merit, new_merit)
         return X_new, U_new, V_new, new_g, new_c, new_merit
 
     X, U, V, new_g, new_c, new_merit = vmap(body)(alpha_values)
     acceptance = vmap(step_acceptance)(new_merit,alpha_values)
-    best_index = np.where(np.any(acceptance),np.argmin(acceptance),0)
+    best_index = jnp.where(jnp.any(acceptance),jnp.argmin(acceptance),0)
     return X[best_index], U[best_index], V[best_index], new_g[best_index], new_c[best_index]
 
 @partial(jit, static_argnums=(0))
@@ -506,13 +462,13 @@ def filter_line_search(
     """
     # Initial values
     alpha = 1.0
-    theta_k = np.sum(current_c * current_c)  # Constraint violation measure
+    theta_k = jnp.sum(current_c * current_c)  # Constraint violation measure
     phi_k = current_cost
-    slope = np.sum(q*dX) + np.sum(r*dU)
+    slope = jnp.sum(q*dX) + jnp.sum(r*dU)
 
     def continuation_criterion(inputs):
         _, _, _, alpha, accepted = inputs
-        return np.logical_and(np.logical_not(accepted), alpha > alpha_min)
+        return jnp.logical_and(jnp.logical_not(accepted), alpha > alpha_min)
 
     def body(inputs):
         _, _, _, alpha, _ = inputs
@@ -524,38 +480,38 @@ def filter_line_search(
 
         # Evaluate at new point
         new_cost, new_c = model_evaluator(X_new, U_new)
-        theta_new = np.sum(new_c * new_c)  # Constraint violation measure
+        theta_new = jnp.sum(new_c * new_c)  # Constraint violation measure
         phi_new = new_cost
 
         # Case 1: Large constraint violation but improving
         condition1 = theta_new > theta_max
-        case1 = np.logical_and(
+        case1 = jnp.logical_and(
             condition1,
             theta_new < (1 - gamma_theta) * theta_k
         )
 
         # Case 2: Small constraint violations and cost is decreasing
-        condition2 =  np.logical_and(
-                np.maximum(theta_new, theta_k) < theta_min,
+        condition2 =  jnp.logical_and(
+                jnp.maximum(theta_new, theta_k) < theta_min,
                 slope < 0
             )
-        case2 = np.logical_and(
+        case2 = jnp.logical_and(
            condition2,
             phi_new < phi_k + eta * alpha * slope
         )
 
         # Case 3: Either cost or constraint violation is significantly reduced
-        condition3 = np.logical_not(np.logical_or(condition1, condition2))
-        case3 = np.logical_and(condition3,np.logical_or(
+        condition3 = jnp.logical_not(jnp.logical_or(condition1, condition2))
+        case3 = jnp.logical_and(condition3,jnp.logical_or(
             phi_new < phi_k - gamma_phi * phi_k,
             theta_new < (1 - gamma_theta) * theta_k
         ))
 
         # Accept if any case is satisfied
-        new_accepted = np.logical_or(np.logical_or(case1, case2), case3)
+        new_accepted = jnp.logical_or(jnp.logical_or(case1, case2), case3)
 
         # If not accepted, reduce alpha
-        alpha = np.where(new_accepted, alpha, gamma_alpha * alpha)
+        alpha = jnp.where(new_accepted, alpha, gamma_alpha * alpha)
 
         return X_new, U_new, V_new, alpha, new_accepted
 
@@ -617,15 +573,15 @@ def parallel_filter_line_search(
       accepted: Whether a step was accepted.
     """
     # Initial values
-    alpha_values = np.exp2(-np.arange(11))
+    alpha_values = jnp.exp2(-jnp.arange(11))
     # alpha = 1.0
-    theta_k = np.sum(current_c * current_c)  # Constraint violation measure
+    theta_k = jnp.sum(current_c * current_c)  # Constraint violation measure
     phi_k = current_cost
-    slope = np.sum(q*dX) + np.sum(r*dU)
+    slope = jnp.sum(q*dX) + jnp.sum(r*dU)
 
     # def continuation_criterion(inputs):
     #     _, _, _, alpha, accepted = inputs
-    #     return np.logical_and(np.logical_not(accepted), alpha > alpha_min)
+    #     return jnp.logical_and(jnp.logical_not(accepted), alpha > alpha_min)
 
     def body(alpha):
         # _, _, _, alpha, _ = inputs
@@ -637,41 +593,41 @@ def parallel_filter_line_search(
 
         # Evaluate at new point
         new_cost, new_c = model_evaluator(X_new, U_new)
-        theta_new = np.sum(new_c * new_c)  # Constraint violation measure
+        theta_new = jnp.sum(new_c * new_c)  # Constraint violation measure
         phi_new = new_cost
 
         # Case 1: Large constraint violation but improving
         condition1 = theta_new > theta_max
-        case1 = np.logical_and(
+        case1 = jnp.logical_and(
             condition1,
             theta_new < (1 - gamma_theta) * theta_k
         )
 
         # Case 2: Small constraint violations and cost is decreasing
-        condition2 =  np.logical_and(
-                np.maximum(theta_new, theta_k) < theta_min,
+        condition2 =  jnp.logical_and(
+                jnp.maximum(theta_new, theta_k) < theta_min,
                 slope < 0
             )
-        case2 = np.logical_and(
+        case2 = jnp.logical_and(
            condition2,
             phi_new < phi_k + eta * alpha * slope
         )
 
         # Case 3: Either cost or constraint violation is significantly reduced
-        condition3 = np.logical_not(np.logical_or(condition1, condition2))
-        case3 = np.logical_and(condition3,np.logical_or(
+        condition3 = jnp.logical_not(jnp.logical_or(condition1, condition2))
+        case3 = jnp.logical_and(condition3,jnp.logical_or(
             phi_new < phi_k - gamma_phi * phi_k,
             theta_new < (1 - gamma_theta) * theta_k
         ))
 
         # Accept if any case is satisfied
-        new_accepted = np.logical_or(np.logical_or(case1, case2), case3)
+        new_accepted = jnp.logical_or(jnp.logical_or(case1, case2), case3)
 
         return X_new, U_new, V_new, new_accepted
 
     # Run the backtracking loop
     X, U, V,accepted = vmap(body)(alpha_values)
-    best_index = np.where(np.any(accepted), np.argmax(accepted), -1)
+    best_index = jnp.where(jnp.any(accepted), jnp.argmax(accepted), -1)
 
     X_new = X[best_index]
     U_new = U[best_index]
@@ -695,19 +651,20 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
       c: the constraint values (a [T+1, n] numpy array).
     """
     T = U.shape[0]
-    costs = vmap(cost)(X, np.pad(U, [[0, 1], [0, 0]]), np.arange(T + 1))
-    g = np.sum(costs)
+    costs = vmap(cost)(X, jnp.pad(U, [[0, 1], [0, 0]]), jnp.arange(T + 1))
+    g = jnp.sum(costs)
 
     residual_fn = lambda t: dynamics(X[t], U[t], t) - X[t + 1]
-    c = np.vstack([x0 - X[0], vmap(residual_fn)(np.arange(T))])
+    c = jnp.vstack([x0 - X[0], vmap(residual_fn)(jnp.arange(T))])
 
     return g, c
-@partial(jit, static_argnums=(0,1,2,3))
+@partial(jit, static_argnums=(0,1,2,3,4))
 def mpc(
     cost,
     dynamics,
     hessian_approx,
     limited_mempory,
+    constraints,
     reference,
     parameter,
     W,
@@ -733,6 +690,7 @@ def mpc(
             _dynamics,
             _hessian_approx,
             limited_mempory,
+            constraints,
             x0,
             X_in,
             U_in,
@@ -742,11 +700,11 @@ def mpc(
         )
     # @jit
     # def merit_function(V, g, c, rho):
-    #     return g + np.sum((V + 0.5 * rho * c) * c)
+    #     return g + jnp.sum((V + 0.5 * rho * c) * c)
 
-    # dV2 = np.sum(dV * dV)
-    # c2 = np.sum(c * c)
-    # rho  = 2.0 * np.sqrt(dV2 / c2)
+    # dV2 = jnp.sum(dV * dV)
+    # c2 = jnp.sum(c * c)
+    # rho  = 2.0 * jnp.sqrt(dV2 / c2)
     # merit = merit_function(V_in, g, c, rho)
 
     # merit_slope = slope(
@@ -820,22 +778,22 @@ def al_mpc(
     eq_constraint_mapped = vectorize(_eq_constraint)
     ineq_constraint_mapped = vectorize(_ineq_constraint)
 
-    pad = lambda A: np.pad(A, [[0, 1], [0, 0]])
+    pad = lambda A: jnp.pad(A, [[0, 1], [0, 0]])
     N = U_in.shape[0]
     # evaluate constraints
     U_pad = pad(U_in)
 
-    equality = eq_constraint_mapped(X_in, U_pad, np.arange(N+1))
-    inequality = ineq_constraint_mapped(X_in, U_pad, np.arange(N+1))
+    equality = eq_constraint_mapped(X_in, U_pad, jnp.arange(N+1))
+    inequality = ineq_constraint_mapped(X_in, U_pad, jnp.arange(N+1))
 
 
     # active_set = jax.vmap(
-    #     lambda t: np.where(
-    #         np.logical_and(np.isclose(V_inequality[t], 0.0), np.less(inequality[t], 0.0)),
+    #     lambda t: jnp.where(
+    #         jnp.logical_and(jnp.isclose(V_inequality[t], 0.0), jnp.less(inequality[t], 0.0)),
     #         0.0,
     #         1.0
     #     )
-    # )(np.arange(N+1))
+    # )(jnp.arange(N+1))
 
     def augmented_lagrangian(W,reference,x, u, t):
 
@@ -848,14 +806,14 @@ def al_mpc(
         # stage inequality constraint
         inequality = _ineq_constraint(x, u, t)
 
-        # active_set = np.invert(np.isclose(V_inequality[t], 0.0) & (inequality < 0.0))
-        # active_set = np.where(np.logical_and(np.isclose(V_inequality[t], 0.0),np.less(inequality,0.0)), 0.0, 1.0)
+        # active_set = jnp.invert(jnp.isclose(V_inequality[t], 0.0) & (inequality < 0.0))
+        # active_set = jnp.where(jnp.logical_and(jnp.isclose(V_inequality[t], 0.0),jnp.less(inequality,0.0)), 0.0, 1.0)
         # update cost
         # J += V_equality[t].T @ equality + 0.5 * penalty * equality.T @ equality
         # J += V_inequality[t].T @ inequality + 0.5 * penalty * inequality.T @ (
         #     active_set * inequality )
-        # J += 0.5/penalty *(np.maximum(inequality + penalty * V_inequality[t],0.0)).T @ (np.maximum(inequality + penalty * V_inequality[t],0.0))
-        J += 0.5*penalty *(np.maximum(inequality,0.0)).T @ (np.maximum(inequality,0.0))
+        # J += 0.5/penalty *(jnp.maximum(inequality + penalty * V_inequality[t],0.0)).T @ (jnp.maximum(inequality + penalty * V_inequality[t],0.0))
+        J += 0.5*penalty *(jnp.maximum(inequality,0.0)).T @ (jnp.maximum(inequality,0.0))
 
         return J
 
@@ -873,11 +831,11 @@ def al_mpc(
         # stage inequality constraint
         inequality = _ineq_constraint(x, u, t)
 
-        # active_set = np.where(np.less(inequality + penalty * V_inequality[t],0.0), 0.0, 1.0)
+        # active_set = jnp.where(jnp.less(inequality + penalty * V_inequality[t],0.0), 0.0, 1.0)
 
-        active_set = np.where(inequality < 0.0, 0.0, 1.0)
-        # active_set = np.where(np.logical_and(np.isclose(V_inequality[t], 0.0),np.less(inequality,0.0)), 0.0, 1.0)
-        penalty_matrix = 0.5*penalty*np.diag(active_set)
+        active_set = jnp.where(inequality < 0.0, 0.0, 1.0)
+        # active_set = jnp.where(jnp.logical_and(jnp.isclose(V_inequality[t], 0.0),jnp.less(inequality,0.0)), 0.0, 1.0)
+        penalty_matrix = 0.5*penalty*jnp.diag(active_set)
 
         Q = Q + J_ineq_x(x, u, t).T @ penalty_matrix @J_ineq_x(x, u, t) #+ 0.5/penalty*J_eq_x(x, u, t).T @ J_eq_x(x, u, t)
         R = R + J_ineq_u(x, u, t).T @ penalty_matrix @J_ineq_u(x, u, t) #+ 0.5/penalty*J_eq_u(x, u, t).T @ J_eq_u(x, u, t)
@@ -903,7 +861,7 @@ def al_mpc(
         return dual + penalty * constraint
 
     def inequality_projection(dual):
-        return np.maximum(dual, 0.0)
+        return jnp.maximum(dual, 0.0)
 
     # vectorize
 
@@ -911,16 +869,16 @@ def al_mpc(
     # evaluate constraints
     U_pad = pad(U)
 
-    equality = eq_constraint_mapped(X, U_pad, np.arange(N+1))
-    inequality = ineq_constraint_mapped(X, U_pad, np.arange(N+1))
+    equality = eq_constraint_mapped(X, U_pad, jnp.arange(N+1))
+    inequality = ineq_constraint_mapped(X, U_pad, jnp.arange(N+1))
     inequality_projected = inequality_projection(inequality)
 
-    # max_constraint_violation = np.maximum(
-    #     np.max(np.abs(equality)),
-    #     np.max(inequality_projected),
+    # max_constraint_violation = jnp.maximum(
+    #     jnp.max(jnp.abs(equality)),
+    #     jnp.max(inequality_projected),
     # )
 
-    # max_dynamics_violation_sq = np.sum(c * c)
+    # max_dynamics_violation_sq = jnp.sum(c * c)
 
     # augmented Lagrangian update
     V_equality_new = dual_update_mapped(equality, V_equality, penalty)
@@ -928,12 +886,12 @@ def al_mpc(
     V_inequality_new = dual_update_mapped(inequality, V_inequality, penalty)
     V_inequality_new = inequality_projection(V_inequality_new)
      
-    penalty *= np.where(np.max(inequality_projected) > tol, 1.5*penalty, penalty)
-    tol *= np.where(np.max(inequality_projected) > tol, 0.5, 1.0)
-    penalty = np.minimum(penalty, 1e2)
+    penalty *= jnp.where(jnp.max(inequality_projected) > tol, 1.5*penalty, penalty)
+    tol *= jnp.where(jnp.max(inequality_projected) > tol, 0.5, 1.0)
+    penalty = jnp.minimum(penalty, 1e2)
 
     X, U, V, V_equality_new, V_inequality_new = jax.lax.cond(
-        np.max(np.abs(equality)) > tol,
+        jnp.max(jnp.abs(equality)) > tol,
         lambda _: (X_in, U_in, V_in, V_equality, V_inequality),
         lambda _: (X, U, V, V_equality_new, V_inequality_new),
         operand=None,
