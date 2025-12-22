@@ -42,56 +42,6 @@ class ADMMWarmStart:
         return cls(*children)
 
 # -----------------------------
-# JAX combine for full TVLQR element (for reference comparison)
-# -----------------------------
-def fn_full(next_elem, prev_elem):
-    n = prev_elem.shape[-1]
-
-    A_l = prev_elem[0:n, :]
-    c_l = prev_elem[n, :]
-    C_l = prev_elem[n + 1 : 2 * n + 1, :]
-    p_l = prev_elem[2 * n + 1, :]
-    P_l = prev_elem[-n:, :]
-
-    A_r = next_elem[0:n, :]
-    c_r = next_elem[n, :]
-    C_r = next_elem[n + 1 : 2 * n + 1, :]
-    p_r = next_elem[2 * n + 1, :]
-    P_r = next_elem[-n:, :]
-
-    # Ar = A_r @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + C_l @ P_r)
-    # Al = A_l.T @ jnp.linalg.inv(jnp.eye(n, dtype=prev_elem.dtype) + P_r @ C_l)
-    
-    # Not sure why but the above is just more stable
-    I = jnp.eye(n, dtype=prev_elem.dtype)    
-    M1 = I + C_l @ P_r
-    M2 = I + P_r @ C_l
-
-    reg = 1e-8
-    M1 = M1 + reg * I
-    M2 = M2 + reg * I
-
-    Ar = jnp.linalg.solve(M1.T, A_r.T).T      # solves X M1 = A_r
-    Al = jnp.linalg.solve(M2.T, A_l).T  
-    # L1 = jnp.linalg.cholesky(M1)
-    # Ar = jax.scipy.linalg.cho_solve((L1, True), A_r.T).T
-
-    # L2 = jnp.linalg.cholesky(M2)
-    # Al = jax.scipy.linalg.cho_solve((L2, True), A_l).T
-
-    A_new = Ar @ A_l
-    c_new = Ar @ (c_l - C_l @ p_r) + c_r
-    C_new = Ar @ C_l @ A_r.T + C_r
-    p_new = Al @ (p_r + P_r @ c_l) + p_l
-    P_new = Al @ P_r @ A_l + P_l
-
-    return jnp.concatenate(
-        [A_new, c_new.reshape(1, n), C_new, p_new.reshape(1, n), P_new],
-        axis=0,
-    )
-
-
-# -----------------------------
 # Helpers (static-shape masking)
 # -----------------------------
 def _shift_down(x, step):

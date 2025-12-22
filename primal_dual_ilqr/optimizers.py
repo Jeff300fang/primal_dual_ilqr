@@ -177,7 +177,8 @@ def compute_search_direction(
 
     cfg = ADMMConfig(
         eps_abs=1e-2,
-        eps_rel=1e-2
+        eps_rel=1e-2,
+        condense_block_size=5
     )
 
     # Indices for position in state
