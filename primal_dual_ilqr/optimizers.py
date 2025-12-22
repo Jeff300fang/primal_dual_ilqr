@@ -110,37 +110,6 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
-def linearize_constraints(Xk, Uk, constraint):
-    T   = Uk.shape[0]
-    Tp1 = T + 1
-    nx  = Xk.shape[1]
-    nu  = Uk.shape[1]
-
-    g0_flat = constraint(Xk, Uk).reshape(-1)
-    m = g0_flat.size // Tp1
-    g0 = g0_flat.reshape(Tp1, m)
-
-    JX_flat, JU_flat = jax.jacrev(constraint, argnums=(0, 1))(Xk, Uk)
-
-    # Reshape to (t_out, m, t_in, nx/nu)
-    JX = JX_flat.reshape(Tp1, m, Tp1, nx)
-    JU = JU_flat.reshape(Tp1, m, T,  nu)
-
-    # C[t] = d g_t / d x_t
-    C = JX[jnp.arange(Tp1), :, jnp.arange(Tp1), :]          # (T+1, m, nx)
-
-    # D[t] = d g_t / d u_t for t=0..T-1
-    D_body = JU[jnp.arange(T), :, jnp.arange(T), :]         # (T, m, nu)
-
-    # Append zeros for t=T
-    D_last = jnp.zeros((1, m, nu), dtype=Xk.dtype)
-    D = jnp.concatenate([D_body, D_last], axis=0)           # (T+1, m, nu)
-
-    f = -g0                                                 # (T+1, m)
-    return C, D, f
-
-
-
 @partial(jit, static_argnums=(0, 1, 2, 3, 4))
 def compute_search_direction(
     cost,
@@ -197,10 +166,14 @@ def compute_search_direction(
     A = A_pad[:-1]
     B = B_pad[:-1]
 
-    start = time.perf_counter()
-    C, D, f = linearize_constraints(X, U, constraints)
-    end = time.perf_counter()
-    jax.debug.print("{}", end - start)
+    pad = lambda A: jnp.pad(A, ((0, 1), (0, 0)))  # (T,m) -> (T+1,m)
+    U_pad = pad(U)
+    t = jnp.arange(X.shape[0])  # (T+1,)
+
+    g = vectorize(constraints)(X, U_pad, t)
+    f = -g
+
+    C, D = linearize(constraints)(X, U_pad, t)
 
     cfg = ADMMConfig(
         eps_abs=1e-2,
