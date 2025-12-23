@@ -21,9 +21,8 @@ def calculate_cost(Q_bar, R_bar, C, D, eta):
 
 def calculate_phis(A, B, Cx, Cxu, Cu, E):
     """
-    Theorem 3:
-      - N parallel Riccati recursions (via tvlqr_gpu) to get K_{k,j}
-      - N parallel forward propagations to get Phi_x, Phi_u
+    Same signature/outputs as calculate_phis, but removes the for-loop in (26)
+    using lax.associative_scan to compute prefix products of F_{k,j} = A_k + B_k K_{k,j}.
 
     Args:
       A:   [T,nx,nx]
@@ -44,50 +43,65 @@ def calculate_phis(A, B, Cx, Cxu, Cu, E):
     zeros_r = jnp.zeros((T, nu), dtype=A.dtype)
     zeros_c = jnp.zeros((T, nx), dtype=A.dtype)
 
-    # Solve one Riccati recursion per disturbance index j
-    # Q_j[t]=Cx[t,j], R_j[t]=Cu[t,j], M_j[t]=Cxu[t,j]
+    # ---- 1) Riccati (unchanged): solve K_{k,j} for each j in parallel ----
     def solve_one_j(j):
-        Qj = Cx[:, j, :, :]     # [T+1,nx,nx]
-        Rj = Cu[:, j, :, :]     # [T,nu,nu]
-        Mj = Cxu[:, j, :, :]    # [T,nx,nu]
+        Qj = Cx[:, j, :, :]      # [T+1,nx,nx]
+        Rj = Cu[:, j, :, :]      # [T,nu,nu]
+        Mj = Cxu[:, j, :, :]     # [T,nx,nu]
         K, _, _, _ = tvlqr_gpu(Qj, zeros_q, Rj, zeros_r, Mj, A, B, zeros_c)
-        return K                # [T,nu,nx]
+        return K                 # [T,nu,nx]
 
-    # K_all has axes (j,k,nu,nx)
-    K_all = vmap(solve_one_j)(jnp.arange(T))  # [T, T, nu, nx]
-    # Convert to K[k,j]
-    K_kj = jnp.swapaxes(K_all, 0, 1)          # [T(k), T(j), nu, nx]
+    # K_all: [T(j), T(k), nu, nx] -> swap to K_kj: [T(k), T(j), nu, nx]
+    K_all = jax.vmap(solve_one_j)(jnp.arange(T))
+    K_kj  = jnp.swapaxes(K_all, 0, 1)  # [T, T, nu, nx]
 
-    # Forward propagation (26)
-    Phi_x = jnp.zeros((T + 1, T, nx, nx), dtype=A.dtype)
-    Phi_u = jnp.zeros((T, T, nu, nx), dtype=A.dtype)
+    # ---- 2) Build F_{k,j} = A_k + B_k K_{k,j}  ----
+    # A[:,None,:,:] broadcasts over j
+    # B[k] @ K[k,j] over j: einsum('x u, j u y -> j x y')
+    BK = jnp.einsum("kxu,kjuy->kjxy", B, K_kj)          # [T,T,nx,nx]
+    F  = A[:, None, :, :] + BK                          # [T,T,nx,nx]
 
-    # Phi_x[j+1,j] = E[j]
-    Phi_x = Phi_x.at[jnp.arange(T) + 1, jnp.arange(T), :, :].set(E)
+    # ---- 3) Turn the lower-triangular recursion into prefix products ----
+    # For each time t (0..T-1) and each j, define element:
+    #   elem[t,j] = I   if t <= j
+    #             = F[t,j] if t > j
+    I = jnp.eye(nx, dtype=A.dtype)
+    t_idx = jnp.arange(T)[:, None]   # [T,1]
+    j_idx = jnp.arange(T)[None, :]   # [1,T]
+    use_F = (t_idx > j_idx)          # [T,T]
 
-    def body(k, carry):
-        Phi_x, Phi_u = carry
+    elems = jnp.where(use_F[:, :, None, None], F, I)  # [T,T,nx,nx]
 
-        # Current Phi_x[k,j] over all j
-        Phix_kj = Phi_x[k, :, :, :]          # [T, nx, nx]
-        K_kj_k  = K_kj[k, :, :, :]           # [T, nu, nx]
+    # Prefix product along time:
+    # We want P[t] = elems[t] @ elems[t-1] @ ... @ elems[0] (chronological)
+    # Using associative_scan with compose(l, r) = r @ l achieves that ordering.
+    def compose(l, r):
+        return jnp.einsum("...ab,...bc->...ac", r, l)
 
-        # Phi_u[k,j] = K[k,j] @ Phi_x[k,j]
-        Phiu_kj = jnp.einsum("jmn,jnp->jmp", K_kj_k, Phix_kj)  # [T, nu, nx]
+    P = lax.associative_scan(compose, elems, axis=0)  # [T,T,nx,nx]
 
-        # Phi_x[k+1,j] = (A[k] + B[k]K[k,j]) Phi_x[k,j]
-        AK = A[k] + jnp.einsum("nm,jmp->jnp", B[k], K_kj_k)    # [T, nx, nx]
-        Phix_next = jnp.einsum("jnn,jnp->jnp", AK, Phix_kj)    # [T, nx, nx]
+    # Now, for k = 1..T:
+    # Phi_x[k,j] = P[k-1,j] @ E[j]
+    # (This gives Phi_x[j+1,j] = I @ E[j] automatically.)
+    Phix_1toT = jnp.einsum("tjab,jbc->tjac", P, E)    # [T,T,nx,nx]
+    Phi_x = jnp.concatenate(
+        [jnp.zeros((1, T, nx, nx), dtype=A.dtype), Phix_1toT],
+        axis=0,
+    )  # [T+1,T,nx,nx]
 
-        # Valid only for j <= k-1 (since Phi_x[k,j] is defined for k>=j+1)
-        valid = (k > jnp.arange(T))[:, None, None]  # [T,1,1]
+    # Mask invalid entries where k <= j  (Phi_x is defined for k >= j+1)
+    k_idx_full = jnp.arange(T + 1)[:, None]              # [T+1,1]
+    valid_x = (k_idx_full >= (j_idx + 1))                # [T+1,T]
+    Phi_x = Phi_x * valid_x[:, :, None, None]
 
-        Phi_u = Phi_u.at[k, :, :, :].set(Phiu_kj * valid)
-        Phi_x = Phi_x.at[k + 1, :, :, :].set(Phi_x[k + 1] + Phix_next * valid)
+    # ---- 4) Phi_u[k,j] = K[k,j] @ Phi_x[k,j] for k=0..T-1 ----
+    # Use Phi_x at time k (not k+1), so slice Phi_x[:-1]
+    Phi_u = jnp.einsum("kjux,kjxn->kjun", K_kj, Phi_x[:-1])  # [T,T,nu,nx]
 
-        return (Phi_x, Phi_u)
+    k_idx = jnp.arange(T)[:, None]                       # [T,1]
+    valid_u = (k_idx >= (j_idx + 1))                     # [T,T]
+    Phi_u = Phi_u * valid_u[:, :, None, None]
 
-    Phi_x, Phi_u = lax.fori_loop(1, T, body, (Phi_x, Phi_u))
     return Phi_x, Phi_u
 
 @jax.jit
@@ -132,7 +146,7 @@ def get_controller(Q, R, A, B, C, D, E, eta):
     Cx_Nj = jnp.broadcast_to(Q[T], (T, nx, nx))              # [T,nx,nx]
     Cx = jnp.concatenate([Cx_kj, Cx_Nj[None, ...]], axis=0)  # [T+1,T,nx,nx]
     Phi_x, Phi_u = calculate_phis(A, B, Cx, Cxu_kj, Cu_kj, E)
-    Phi_x_p, Phi_u_p = calculate_phis_parallel(A, B, Cx, Cxu_kj, Cu_kj, E)
+
     return Phi_x, Phi_u, (Cx, Cxu_kj, Cu_kj)
 
 def make_dummy_problem(
@@ -217,7 +231,7 @@ def make_dummy_problem(
     return Q, R, A, B, C, D, E, eta
 
 def main():
-    Q, R, A, B, C, D, E, eta = make_dummy_problem(T=200, nx=61, nu=13, nc=10)
+    Q, R, A, B, C, D, E, eta = make_dummy_problem(T=50, nx=61, nu=13, nc=10)
     get_controller(
         Q=Q,
         R=R,
