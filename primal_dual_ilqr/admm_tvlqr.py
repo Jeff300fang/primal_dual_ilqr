@@ -7,6 +7,7 @@ from jax.tree_util import register_pytree_node_class
 from typing import NamedTuple
 import math
 from functools import partial
+import time
 # -----------------------------
 # Cache container (PyTree-friendly)
 # -----------------------------
@@ -573,5 +574,5 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
         it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
     )
-
-    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, converged
+    mu = rho_final * y_bar
+    return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged

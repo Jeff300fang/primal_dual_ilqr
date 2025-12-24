@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from functools import partial
 
 from trajax.optimizers import linearize, quadratize,vectorize
-
+from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls_utils import get_etas, get_constraint_tightenings, get_betas, get_controller
 from .admm_tvlqr import constrained_solve, ADMMConfig
 import time
 
@@ -116,7 +116,7 @@ def compute_search_direction(
     dynamics,
     hessian_approx,
     limited_memory,
-    constraints,
+    constraints, h_ct,
     x0,
     X,
     U,
@@ -171,7 +171,7 @@ def compute_search_direction(
     t = jnp.arange(X.shape[0])  # (T+1,)
 
     g = vectorize(constraints)(X, U_pad, t)
-    f = -g
+    f = -g - h_ct
 
     C, D = linearize(constraints)(X, U_pad, t)
 
@@ -181,17 +181,13 @@ def compute_search_direction(
         condense_block_size=5
     )
 
-    # Indices for position in state
-    px_idx, py_idx = 0, 1
-    jax.debug.print("p0 = ({}, {})", X[0, px_idx], X[0, py_idx])
-
     # Solve constrained QP for the SQP step (dX, dU)
-    dX, dU, dV, w, y, rho, converged = constrained_solve(
+    dX, dU, dV, w, y, rho, mu, converged = constrained_solve(
         cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
     )
     def converged_branch(state):
         # state = (w, y, rho)
-        return dX, dU, dV, state[0], state[1], state[2], converged
+        return dX, dU, dV, state[0], state[1], state[2], mu, converged
 
     def not_converged_branch(state):
         # jax.debug.print("Failed first solve, resolving from clean start")
@@ -200,19 +196,19 @@ def compute_search_direction(
         y_init = jnp.zeros_like(y0)
         rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
 
-        dX2, dU2, dV2, w2, y2, rho2, conv2 = constrained_solve(
+        dX2, dU2, dV2, w2, y2, rho2, mu, conv2 = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
         )
-        return dX2, dU2, dV2, w2, y2, rho2, conv2
+        return dX2, dU2, dV2, w2, y2, rho2, mu, conv2
 
-    dX, dU, dV, w, y, rho, converged = lax.cond(
+    dX, dU, dV, w, y, rho, mu, converged = lax.cond(
         converged,
         converged_branch,
         not_converged_branch,
         operand=(w, y, rho),
     )
 
-    return dX, dU, dV, q, r, w, y, rho
+    return dX, dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D
 
 @jit
 def merit_rho(c, dV):
@@ -639,6 +635,7 @@ def mpc(
     hessian_approx,
     limited_mempory,
     constraints,
+    E,
     reference,
     parameter,
     W,
@@ -658,70 +655,48 @@ def mpc(
         _hessian_approx = None
     _dynamics = partial(dynamics,parameter=parameter)
     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics,x0)
-    g, c = model_evaluator(X_in, U_in)
-    dX,dU, dV, q, r, w, y, rho = compute_search_direction(
-            _cost,
-            _dynamics,
-            _hessian_approx,
-            limited_mempory,
-            constraints,
-            x0,
-            X_in,
-            U_in,
-            V_in,
-            c,
-            w, y, rho
-        )
-    # @jit
-    # def merit_function(V, g, c, rho):
-    #     return g + jnp.sum((V + 0.5 * rho * c) * c)
+    X_curr = X_in
+    U_curr = U_in
+    V_curr = V_in
+    max_sls_iterations = 1
+    px_idx, py_idx = 0, 1
+    jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
+    Tp1 = X_curr.shape[0]
+    nc = w.shape[1]
+    T = Tp1 - 1
+    # TODO: Warm start these?
+    beta = jnp.zeros((Tp1, T, nc)) * 1e-10 
+    # --------- Fast SLS Loop ---------
+    for i in range(max_sls_iterations):
+        # Nominal Trajectory Update
+        g, c = model_evaluator(X_curr, U_curr)
+        h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
+        jax.debug.print("{}", h_ct)
+        dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
+                _cost,
+                _dynamics,
+                _hessian_approx,
+                limited_mempory,
+                constraints,
+                h_ct,
+                x0,
+                X_curr,
+                U_curr,
+                V_curr,
+                c,
+                w, y, rho
+            )
+        X_curr = X_curr + dX
+        U_curr = U_curr + dU
+        V_curr = V_curr + dV
+        eta = get_etas(mu, beta)
+        Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
+        beta = get_betas(C, D, Phi_x, Phi_u)
 
-    # dV2 = jnp.sum(dV * dV)
-    # c2 = jnp.sum(c * c)
-    # rho  = 2.0 * jnp.sqrt(dV2 / c2)
-    # merit = merit_function(V_in, g, c, rho)
 
-    # merit_slope = slope(
-    #     dX,
-    #     dU,
-    #     dV,
-    #     c,
-    #     q,
-    #     r,
-    #     rho,
-    # )
-    # X_new, U_new, V_new, g_new, c_new = parallel_line_search(
-    #         partial(merit_function, rho=rho),
-    #         model_evaluator,
-    #         X_in,
-    #         U_in,
-    #         V_in,
-    #         dX,
-    #         dU,
-    #         dV,
-    #         merit,
-    #         g,
-    #         c,
-    #         merit_slope,
-    #         armijo_factor=1e-4,
-    #     )
-    # X_new, U_new, V_new = parallel_filter_line_search(
-    # model_evaluator,
-    # X_in,
-    # U_in,
-    # V_in,
-    # dX,
-    # dU,
-    # dV,
-    # g,
-    # c,
-    # q,
-    # r,)
-    X_new = X_in + dX
-    U_new = U_in + dU
-    V_new = V_in + dV
+    # ------- End Fast SLS Loop --------
 
-    return X_new, U_new, V_new, w, y, rho
+    return X_curr, U_curr, V_curr, w, y, rho
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
 def al_mpc(
