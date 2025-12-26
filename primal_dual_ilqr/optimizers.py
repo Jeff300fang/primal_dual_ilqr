@@ -628,14 +628,14 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
     c = jnp.vstack([x0 - X[0], vmap(residual_fn)(jnp.arange(T))])
 
     return g, c
-@partial(jit, static_argnums=(0,1,2,3,4))
+@partial(jit, static_argnums=(0,1,2,3,4,5))
 def mpc(
     cost,
     dynamics,
     hessian_approx,
     limited_mempory,
     constraints,
-    E,
+    disturbance,
     reference,
     parameter,
     W,
@@ -660,7 +660,6 @@ def mpc(
     V_curr = V_in
     max_sls_iterations = 1
     px_idx, py_idx = 0, 1
-    jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
     Tp1 = X_curr.shape[0]
     nc = w.shape[1]
     T = Tp1 - 1
@@ -670,8 +669,8 @@ def mpc(
     for i in range(max_sls_iterations):
         # Nominal Trajectory Update
         g, c = model_evaluator(X_curr, U_curr)
+        E = disturbance(X_curr[:-1])
         h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
-        jax.debug.print("{}", h_ct)
         dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
                 _cost,
                 _dynamics,
@@ -692,10 +691,12 @@ def mpc(
         eta = get_etas(mu, beta)
         Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
         beta = get_betas(C, D, Phi_x, Phi_u)
+        h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
+        # jax.debug.print("{}", h_ct)
 
 
     # ------- End Fast SLS Loop --------
-
+    # jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
     return X_curr, U_curr, V_curr, w, y, rho
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
