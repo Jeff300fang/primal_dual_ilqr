@@ -666,37 +666,54 @@ def mpc(
     # TODO: Warm start these?
     beta = jnp.zeros((Tp1, T, nc)) * 1e-10 
     # --------- Fast SLS Loop ---------
-    for i in range(max_sls_iterations):
-        # Nominal Trajectory Update
-        g, c = model_evaluator(X_curr, U_curr)
-        E = disturbance(X_curr[:-1])
-        h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
-        dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
-                _cost,
-                _dynamics,
-                _hessian_approx,
-                limited_mempory,
-                constraints,
-                h_ct,
-                x0,
-                X_curr,
-                U_curr,
-                V_curr,
-                c,
-                w, y, rho
-            )
-        X_curr = X_curr + dX
-        U_curr = U_curr + dU
-        V_curr = V_curr + dV
-        eta = get_etas(mu, beta)
-        Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
-        beta = get_betas(C, D, Phi_x, Phi_u)
-        h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
+    # for i in range(max_sls_iterations):
+    #     # Nominal Trajectory Update
+    #     g, c = model_evaluator(X_curr, U_curr)
+    #     E = disturbance(X_curr[:-1])
+    #     h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
+    #     dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
+    #             _cost,
+    #             _dynamics,
+    #             _hessian_approx,
+    #             limited_mempory,
+    #             constraints,
+    #             h_ct,
+    #             x0,
+    #             X_curr,
+    #             U_curr,
+    #             V_curr,
+    #             c,
+    #             w, y, rho
+    #         )
+    #     X_curr = X_curr + dX
+    #     U_curr = U_curr + dU
+    #     V_curr = V_curr + dV
+    #     eta = get_etas(mu, beta)
+    #     Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
+    #     beta = get_betas(C, D, Phi_x, Phi_u)
+    #     h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
         # jax.debug.print("{}", h_ct)
-
-
     # ------- End Fast SLS Loop --------
     # jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
+    g, c = model_evaluator(X_curr, U_curr)
+    h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
+    dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
+            _cost,
+            _dynamics,
+            _hessian_approx,
+            limited_mempory,
+            constraints,
+            h_ct,
+            x0,
+            X_curr,
+            U_curr,
+            V_curr,
+            c,
+            w, y, rho
+        )
+    X_curr = X_curr + dX
+    U_curr = U_curr + dU
+    V_curr = V_curr + dV
     return X_curr, U_curr, V_curr, w, y, rho
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
