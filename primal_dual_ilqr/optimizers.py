@@ -178,7 +178,8 @@ def compute_search_direction(
     cfg = ADMMConfig(
         eps_abs=1e-2,
         eps_rel=1e-2,
-        condense_block_size=5
+        condense_block_size=5,
+        rho_max=50
     )
 
     # Solve constrained QP for the SQP step (dX, dU)
@@ -190,11 +191,10 @@ def compute_search_direction(
         return dX, dU, dV, state[0], state[1], state[2], mu, converged
 
     def not_converged_branch(state):
-        # jax.debug.print("Failed first solve, resolving from clean start")
         w0, y0, rho0 = state
         w_init = jnp.zeros_like(w0)
         y_init = jnp.zeros_like(y0)
-        rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
+        rho_init = jnp.asarray(0.1, dtype=jnp.float32)
 
         dX2, dU2, dV2, w2, y2, rho2, mu, conv2 = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init

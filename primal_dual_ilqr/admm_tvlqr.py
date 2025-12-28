@@ -26,6 +26,7 @@ class ADMMConfig:
     eps_abs: float = 1e-2
     eps_rel: float = 1e-2
     condense_block_size: int = 1
+    rho_max: int = 1e5
 
 @register_pytree_node_class
 @dataclass
@@ -355,8 +356,8 @@ def compute_Ginv(R, B, P):
 
     return vmap(one)(jnp.arange(T))
 
-def rho_update_y(rp_norm, rd_norm, rho, y):
-    rho_new, updated = adaptive_rho_update(rp_norm, rd_norm, rho)
+def rho_update_y(rp_norm, rd_norm, rho, y, rho_max):
+    rho_new, updated = adaptive_rho_update(rp_norm, rd_norm, rho, rho_max=rho_max)
     y_new = lax.cond(
         updated,
         lambda _: (rho / rho_new) * y,
@@ -444,6 +445,7 @@ def get_K(tilde_R, tilde_M, A, B, P):
 
 def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho):
     # --- one ADMM iteration ---
+    rho_max = cfg.rho_max
     def one_iter(carry):
         (it, tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M, 
          x_bar, u_bar, y_bar, w_prev, rho, cache, BRinv, MRinv, P, _, K,
@@ -488,7 +490,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         def update_fn(_):
             rho_upd, y_upd, updated = rho_update_y(
                 rp_norm, rd_norm,
-                rho, y_new
+                rho, y_new, rho_max
             )
             return rho_upd, y_upd, updated
 
@@ -570,9 +572,9 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, _, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
 
     v = dual_lqr(x_bar, P_final, p_final)
-    jax.debug.print(
-        "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
-        it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
-    )
+    # jax.debug.print(
+    #     "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
+    #     it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
+    # )
     mu = rho_final * y_bar
     return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged
