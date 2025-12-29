@@ -6,7 +6,7 @@ from functools import partial
 
 from trajax.optimizers import linearize, quadratize,vectorize
 from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls_utils import get_etas, get_constraint_tightenings, get_betas, get_controller
-from .admm_tvlqr import constrained_solve, ADMMConfig
+from .admm_tvlqr import constrained_solve
 import time
 
 def linearize_scan(fun, argnums=3):
@@ -110,8 +110,9 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
-@partial(jit, static_argnums=(0, 1, 2, 3, 4))
+@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5))
 def compute_search_direction(
+    admm_config,
     cost,
     dynamics,
     hessian_approx,
@@ -175,12 +176,7 @@ def compute_search_direction(
 
     C, D = linearize(constraints)(X, U_pad, t)
 
-    cfg = ADMMConfig(
-        eps_abs=1e-2,
-        eps_rel=1e-2,
-        condense_block_size=5,
-        rho_max=50
-    )
+    cfg = admm_config
 
     # Solve constrained QP for the SQP step (dX, dU)
     dX, dU, dV, w, y, rho, mu, converged = constrained_solve(
@@ -628,8 +624,9 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
     c = jnp.vstack([x0 - X[0], vmap(residual_fn)(jnp.arange(T))])
 
     return g, c
-@partial(jit, static_argnums=(0,1,2,3,4,5))
+@partial(jit, static_argnums=(0,1,2,3,4,5,6))
 def mpc(
+    admm_config,
     cost,
     dynamics,
     hessian_approx,
@@ -695,9 +692,11 @@ def mpc(
         # jax.debug.print("{}", h_ct)
     # ------- End Fast SLS Loop --------
     # jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
+    # jax.debug.print("Distance to goal: {}", ((X_curr[0, px_idx] - 2.0) ** 2 + (X_curr[0, py_idx] - 0.1) ** 2)**0.5)
     g, c = model_evaluator(X_curr, U_curr)
     h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
     dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
+            admm_config, 
             _cost,
             _dynamics,
             _hessian_approx,

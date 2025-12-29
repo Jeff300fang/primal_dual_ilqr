@@ -19,7 +19,8 @@ class ACPScanCache(NamedTuple):
     Cn:  jnp.ndarray
     Pn:  jnp.ndarray
 
-@dataclass
+@register_pytree_node_class
+@dataclass(frozen=True)
 class ADMMConfig:
     rho_update_frequency: int = 25
     max_iterations: int = 400
@@ -27,6 +28,14 @@ class ADMMConfig:
     eps_rel: float = 1e-2
     condense_block_size: int = 1
     rho_max: int = 1e5
+
+    def tree_flatten(self):
+        children = (self.rho_update_frequency, self.max_iterations, self.eps_abs, self.eps_rel, self.condense_block_size, self.rho_max)
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
 
 @register_pytree_node_class
 @dataclass
@@ -298,28 +307,53 @@ def admm_augment_xu(Q, q, R, r, M, C, D, w_bar, y_bar, rho):
 
     return tilde_Q, tilde_q, tilde_R, tilde_r, tilde_M
 
+# def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
+#     """
+#     z, w, w_prev, y: (T+1, m)
+#     Returns scalar norms and (optional) thresholds.
+#     """
+#     r = z - w                          # primal residual
+#     s = rho * (w - w_prev)             # dual residual (A=I)
+
+#     # Norms over all time/constraints
+#     r_norm = jnp.linalg.norm(r.reshape(-1), ord=2)
+#     s_norm = jnp.linalg.norm(s.reshape(-1), ord=2)
+
+#     # Stopping thresholds (Boyd et al., scaled form)
+#     n = r.size
+#     z_norm = jnp.linalg.norm(z.reshape(-1), ord=2)
+#     w_norm = jnp.linalg.norm(w.reshape(-1), ord=2)
+#     y_norm = jnp.linalg.norm(y.reshape(-1), ord=2)
+
+#     eps_pri = jnp.sqrt(n) * eps_abs + eps_rel * z_norm
+#     eps_dual = jnp.sqrt(n) * eps_abs + eps_rel * (rho * y_norm)
+
+#     return r_norm, s_norm, eps_pri, eps_dual
+
 def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
     """
     z, w, w_prev, y: (T+1, m)
-    Returns scalar norms and (optional) thresholds.
+    Returns infinity-norm residuals and thresholds.
     """
-    r = z - w                          # primal residual
-    s = rho * (w - w_prev)             # dual residual (A=I)
+    # Residuals
+    r = z - w                  # primal residual
+    s = rho * (w - w_prev)     # dual residual (A = I)
 
-    # Norms over all time/constraints
-    r_norm = jnp.linalg.norm(r.reshape(-1), ord=2)
-    s_norm = jnp.linalg.norm(s.reshape(-1), ord=2)
+    # Infinity norms over all time/constraints
+    r_norm = jnp.linalg.norm(r.reshape(-1), ord=jnp.inf)
+    s_norm = jnp.linalg.norm(s.reshape(-1), ord=jnp.inf)
 
-    # Stopping thresholds (Boyd et al., scaled form)
-    n = r.size
-    z_norm = jnp.linalg.norm(z.reshape(-1), ord=2)
-    w_norm = jnp.linalg.norm(w.reshape(-1), ord=2)
-    y_norm = jnp.linalg.norm(y.reshape(-1), ord=2)
+    # Infinity norms of variables
+    z_norm = jnp.linalg.norm(z.reshape(-1), ord=jnp.inf)
+    w_norm = jnp.linalg.norm(w.reshape(-1), ord=jnp.inf)
+    y_norm = jnp.linalg.norm(y.reshape(-1), ord=jnp.inf)
 
-    eps_pri = jnp.sqrt(n) * eps_abs + eps_rel * z_norm
-    eps_dual = jnp.sqrt(n) * eps_abs + eps_rel * (rho * y_norm)
+    # Stopping thresholds (∞-norm version)
+    eps_pri = eps_abs + eps_rel * jnp.maximum(z_norm, w_norm)
+    eps_dual = eps_abs + eps_rel * (rho * y_norm)
 
     return r_norm, s_norm, eps_pri, eps_dual
+
 
 def adaptive_rho_update(rp_norm, rd_norm, rho,
                         clip_min=0.2, clip_max=5,
@@ -572,9 +606,9 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, _, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
 
     v = dual_lqr(x_bar, P_final, p_final)
-    # jax.debug.print(
-    #     "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
-    #     it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
-    # )
+    jax.debug.print(
+        "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",
+        it - 1, converged, rho_final, rp_norm, eps_pri, rd_norm, eps_dual, rho0
+    )
     mu = rho_final * y_bar
     return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged
