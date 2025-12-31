@@ -17,8 +17,8 @@ def project_psd_cone(Q, delta=0.0):
     [n, n] symmetric matrix projection of the input.
   """
   S, V = np.linalg.eigh(Q)
-  jax.debug.print("S {}", S)
-  jax.debug.print("V {}", V[:14,:3])
+#   jax.debug.print("S {}", S)
+#   jax.debug.print("V {}", V[:14,:3])
   S = np.maximum(S, delta)
   Q_plus = np.matmul(V, np.matmul(np.diag(S), V.T))
   return 0.5 * (Q_plus + Q_plus.T)

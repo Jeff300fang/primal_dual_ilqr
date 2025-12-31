@@ -6,7 +6,18 @@ from functools import partial
 
 from trajax.optimizers import vectorize
 
-from primal_dual_ilqr.primal_dual_ilqr.old_optimazers import primal_dual_ilqr
+from mpx.primal_dual_ilqr.primal_dual_ilqr.old_optimazers import primal_dual_ilqr
+
+def safe_max_abs(a):
+    # Flatten, then append a 0 so length >= 1 always.
+    a1 = np.ravel(a)
+    a1 = np.concatenate([a1, np.zeros((1,), dtype=a.dtype)], axis=0)
+    return np.max(np.abs(a1))
+
+def safe_max(a):
+    a1 = np.ravel(a)
+    a1 = np.concatenate([a1, np.zeros((1,), dtype=a.dtype)], axis=0)
+    return np.max(a1)
 
 
 @partial(
@@ -179,10 +190,10 @@ def constrained_primal_dual_ilqr(
         inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
         inequality_constraints_projected = inequality_projection(inequality_constraints)
 
-        max_constraint_violation = np.maximum(
-            np.max(np.abs(equality_constraints)),
-            np.max(inequality_constraints_projected),
-        )
+        max_eq = safe_max_abs(equality_constraints)
+        max_ineq = safe_max(inequality_constraints_projected)
+
+        max_constraint_violation = np.maximum(max_eq, max_ineq)
 
         max_dynamics_violation_sq = np.sum(c * c)
 
@@ -239,9 +250,10 @@ def constrained_primal_dual_ilqr(
             max_constraint_violation * max_constraint_violation > c_sq_threshold,
             max_dynamics_violation_sq > c_sq_threshold,
         )
-        max_complementary_slack = np.max(
-            np.abs(inequality_constraints * dual_inequality)
-        )
+        comp = np.ravel(np.abs(inequality_constraints * dual_inequality))
+        comp = np.concatenate([comp, np.zeros((1,), dtype=comp.dtype)], axis=0)
+        max_complementary_slack = np.max(comp)
+
         it_ok = np.logical_and(
             iteration_ilqr < max_iterations, iteration_al < max_al_iterations
         )
