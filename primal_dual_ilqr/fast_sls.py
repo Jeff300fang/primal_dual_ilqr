@@ -12,6 +12,7 @@ from dataclasses import dataclass
 class SLSConfig:
     max_sls_iterations: int = 2
     sls_primal_tol: float = 1e-2
+    enable_fastsls: bool = True
 
 
 @jax.jit

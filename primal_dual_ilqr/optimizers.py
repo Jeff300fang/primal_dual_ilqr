@@ -6,6 +6,8 @@ from functools import partial
 
 from trajax.optimizers import linearize, quadratize,vectorize
 from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import fast_sls_solve_gpu
+from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import SLSConfig
+from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
 
 def linearize_scan(fun, argnums=3):
     """Gradient or Jacobian operator using scan.
@@ -110,7 +112,7 @@ def lagrangian(cost, dynamics, x0):
 
 @partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 def compute_search_direction(
-    sls_config,
+    sls_config: SLSConfig,
     admm_config,
     cost,
     dynamics,
@@ -178,9 +180,16 @@ def compute_search_direction(
     cfg = admm_config
 
     # Solve constrained QP for the SQP step (dX, dU)
-    dX, dU, dV, w, y, rho, converged, converged_admm = fast_sls_solve_gpu(
-        cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E
-    )
+    if sls_config.enable_fastsls:
+        dX, dU, dV, w, y, rho, converged, converged_admm = fast_sls_solve_gpu(
+            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E
+        )
+    else:
+        dX, dU, dV, w, y, rho, _, converged_admm = constrained_solve(
+            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
+        )
+        converged = True
+
     def converged_branch(state):
         # state = (w, y, rho)
         return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm
