@@ -3,18 +3,9 @@ import jax
 import jax.numpy as jnp
 
 from functools import partial
-from dataclasses import dataclass
 
 from trajax.optimizers import linearize, quadratize,vectorize
-from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls_utils import get_etas, get_constraint_tightenings, get_betas, get_controller
-from .admm_tvlqr import constrained_solve
-import time
-
-@dataclass(frozen=True)
-class SLSConfig:
-    max_sls_iterations: float = 2
-    sls_primal_tol: float = 1e-2
-
+from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import fast_sls_solve_gpu
 
 def linearize_scan(fun, argnums=3):
     """Gradient or Jacobian operator using scan.
@@ -117,14 +108,15 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
-@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5))
+@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 def compute_search_direction(
+    sls_config,
     admm_config,
     cost,
     dynamics,
     hessian_approx,
     limited_memory,
-    constraints, h_ct,
+    constraints, disturbance,
     x0,
     X,
     U,
@@ -179,19 +171,19 @@ def compute_search_direction(
     t = jnp.arange(X.shape[0])  # (T+1,)
 
     g = vectorize(constraints)(X, U_pad, t)
-    f = -g - h_ct
+    f = -g
 
     C, D = linearize(constraints)(X, U_pad, t)
-
+    E = disturbance(X[:-1])
     cfg = admm_config
 
     # Solve constrained QP for the SQP step (dX, dU)
-    dX, dU, dV, w, y, rho, mu, converged = constrained_solve(
-        cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
+    dX, dU, dV, w, y, rho, converged, converged_admm = fast_sls_solve_gpu(
+        cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E
     )
     def converged_branch(state):
         # state = (w, y, rho)
-        return dX, dU, dV, state[0], state[1], state[2], mu, converged
+        return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm
 
     def not_converged_branch(state):
         w0, y0, rho0 = state
@@ -199,19 +191,20 @@ def compute_search_direction(
         y_init = jnp.zeros_like(y0)
         rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
 
-        dX2, dU2, dV2, w2, y2, rho2, mu, conv2 = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
+        dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2 = fast_sls_solve_gpu(
+            cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
+            sls_config, E
         )
-        return dX2, dU2, dV2, w2, y2, rho2, mu, conv2
+        return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2
 
-    dX, dU, dV, w, y, rho, mu, converged = lax.cond(
-        converged,
+    dX, dU, dV, w, y, rho, converged, converged_admm = lax.cond(
+        converged_admm,
         converged_branch,
         not_converged_branch,
         operand=(w, y, rho),
     )
 
-    return dX, dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D
+    return dX, dU, dV, q, r, w, y, rho
 
 @jit
 def merit_rho(c, dV):
@@ -632,29 +625,6 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
 
     return g, c
 
-@jax.jit
-def _scaled_primal_diff(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
-    """
-    Returns a scaled infinity-norm difference:
-        ||a-b||_inf / max(1, ||b||_inf)
-    """
-    num = jnp.max(jnp.abs(a - b))
-    den = jnp.maximum(1.0, jnp.max(jnp.abs(b)))
-    return num / (den + eps)
-
-@jax.jit
-def primal_convergence_metric(
-    X_new: jnp.ndarray, U_new: jnp.ndarray, V_new: jnp.ndarray,
-    X_old: jnp.ndarray, U_old: jnp.ndarray, V_old: jnp.ndarray,
-) -> jnp.ndarray:
-    """
-    Single scalar convergence metric = max of scaled diffs across primal blocks.
-    """
-    mX = _scaled_primal_diff(X_new, X_old)
-    mU = _scaled_primal_diff(U_new, U_old)
-    mV = _scaled_primal_diff(V_new, V_old)
-    return jnp.maximum(jnp.maximum(mX, mU), mV)
-
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7))
 def mpc(
     sls_config,
@@ -687,194 +657,28 @@ def mpc(
     X_curr = X_in
     U_curr = U_in
     V_curr = V_in
-    Tp1 = X_curr.shape[0]
-    nc = w.shape[1]
-    T = Tp1 - 1
-    # TODO: Warm start these?
-    beta = jnp.zeros((Tp1, T, nc)) * 1e-10 
-    # --------- Fast SLS Loop ---------
-    # for i in range(sls_config.max_sls_iterations):
-    #     # Nominal Trajectory Update
-    #     X_prev = X_curr
-    #     U_prev = U_curr
-    #     V_prev = V_curr
-    #     g, c = model_evaluator(X_curr, U_curr)
-    #     E = disturbance(X_curr[:-1])
-    #     h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
-    #     dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
-    #             admm_config,
-    #             _cost,
-    #             _dynamics,
-    #             _hessian_approx,
-    #             limited_mempory,
-    #             constraints,
-    #             h_ct,
-    #             x0,
-    #             X_curr,
-    #             U_curr,
-    #             V_curr,
-    #             c,
-    #             w, y, rho
-    #         )
-    #     X_curr = X_curr + dX
-    #     U_curr = U_curr + dU
-    #     V_curr = V_curr + dV
-    #     metric = primal_convergence_metric(X_curr, U_curr, V_curr, X_prev, U_prev, V_prev)
-    #     if metric <= sls_config.sls_primal_tol:
-    #         break
-    #     eta = get_etas(mu, beta)
-    #     Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
-    #     beta = get_betas(C, D, Phi_x, Phi_u)
-    #     h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
-    #     jax.debug.print("{}", h_ct)
-    # ------- End Fast SLS Loop --------
-    # jax.debug.print("p0 = ({}, {})", X_curr[0, px_idx], X_curr[0, py_idx])
-    # jax.debug.print("Distance to goal: {}", ((X_curr[0, px_idx] - 2.0) ** 2 + (X_curr[0, py_idx] - 0.1) ** 2)**0.5)
     g, c = model_evaluator(X_curr, U_curr)
-    h_ct  = get_constraint_tightenings(beta, eps_beta=1e-6)
-    dX,dU, dV, q, r, w, y, rho, mu, Q, R, A, B, C, D = compute_search_direction(
-            admm_config, 
-            _cost,
-            _dynamics,
-            _hessian_approx,
-            limited_mempory,
-            constraints,
-            h_ct,
-            x0,
-            X_curr,
-            U_curr,
-            V_curr,
-            c,
-            w, y, rho
-        )
+    dX, dU, dV, q, r, w, y, rho = compute_search_direction(
+                sls_config,
+                admm_config,
+                _cost,
+                _dynamics,
+                _hessian_approx,
+                limited_mempory,
+                constraints,
+                disturbance,
+                x0,
+                X_curr,
+                U_curr,
+                V_curr,
+                c,
+                w, y, rho
+            )
     X_curr = X_curr + dX
     U_curr = U_curr + dU
     V_curr = V_curr + dV
     return X_curr, U_curr, V_curr, w, y, rho
 
-# @partial(jit, static_argnums=(0,1,2,3,4,5,6,7))
-# def mpc(
-#     sls_config,
-#     admm_config,
-#     cost,
-#     dynamics,
-#     hessian_approx,
-#     limited_mempory,
-#     constraints,
-#     disturbance,
-#     reference,
-#     parameter,
-#     W,
-#     x0,
-#     X_in,
-#     U_in,
-#     V_in,
-#     w,
-#     y,
-#     rho,
-# ):
-#     _cost = partial(cost, W, reference)
-#     if hessian_approx is not None:
-#         _hessian_approx = partial(hessian_approx, W, reference)
-#     else:
-#         _hessian_approx = None
-
-#     _dynamics = partial(dynamics, parameter=parameter)
-#     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics, x0)
-
-#     X0 = X_in
-#     U0 = U_in
-#     V0 = V_in
-
-#     Tp1 = X0.shape[0]
-#     nc = w.shape[1]
-#     T = Tp1 - 1
-
-#     # Warm start beta if you want; keeping your original behavior.
-#     beta0 = jnp.zeros((Tp1, T, nc), dtype=X0.dtype) * 1e-10
-
-#     maxit = sls_config.max_sls_iterations
-#     tol = sls_config.sls_primal_tol
-
-#     # Carry: (done, X, U, V, w, y, rho, beta)
-#     init_carry = (False, X0, U0, V0, w, y, rho, beta0)
-
-#     def body(i, carry):
-#         done, X_curr, U_curr, V_curr, w, y, rho, beta = carry
-
-#         # If we've converged already, freeze everything (break-like behavior).
-#         def do_nothing(carry_):
-#             return carry_
-
-#         # Otherwise, do one SLS iteration.
-#         def do_update(carry_):
-#             done_, X_curr_, U_curr_, V_curr_, w_, y_, rho_, beta_ = carry_
-
-#             X_prev = X_curr_
-#             U_prev = U_curr_
-#             V_prev = V_curr_
-
-#             g, c = model_evaluator(X_curr_, U_curr_)
-#             E = disturbance(X_curr_[:-1])
-#             h_ct = get_constraint_tightenings(beta_, eps_beta=1e-6)
-#             # jax.debug.print("hct: {}", h_ct)
-
-#             (dX, dU, dV,
-#              q, r, w_new, y_new, rho_new, mu,
-#              Q, R, A, B, C, D) = compute_search_direction(
-#                 admm_config,
-#                 _cost,
-#                 _dynamics,
-#                 _hessian_approx,
-#                 limited_mempory,
-#                 constraints,
-#                 h_ct,
-#                 x0,
-#                 X_curr_,
-#                 U_curr_,
-#                 V_curr_,
-#                 c,
-#                 w_, y_, rho_,
-#             )
-
-#             X_next = X_curr_ + dX
-#             U_next = U_curr_ + dU
-#             V_next = V_curr_ + dV
-
-#             metric = primal_convergence_metric(X_next, U_next, V_next, X_prev, U_prev, V_prev)
-#             done_next = metric <= tol
-
-#             # Only update controller/beta if we are NOT done after this iteration.
-#             def update_beta(_):
-#                 eta = get_etas(mu, beta_)
-#                 Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
-#                 beta_next_ = get_betas(C, D, Phi_x, Phi_u)
-#                 return beta_next_
-
-#             beta_next = jax.lax.cond(
-#                 done_next,
-#                 lambda _: beta_,     # keep old beta if converged
-#                 update_beta,
-#                 operand=None,
-#             )
-
-#             # Gate debug printing to only happen while still iterating.
-#             def print_branch(_):
-#                 h_ct2 = get_constraint_tightenings(beta_next, eps_beta=1e-6)
-#                 # jax.debug.print("{}", h_ct2)
-#                 return None
-
-#             _ = jax.lax.cond(done_next, lambda _: None, print_branch, operand=None)
-
-#             return (done_next, X_next, U_next, V_next, w_new, y_new, rho_new, beta_next)
-
-#         return jax.lax.cond(done, do_nothing, do_update, carry)
-
-#     done, X_curr, U_curr, V_curr, w, y, rho, beta = jax.lax.fori_loop(
-#         0, maxit, body, init_carry
-#     )
-
-#     return X_curr, U_curr, V_curr, w, y, rho
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
 def al_mpc(

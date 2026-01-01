@@ -1,9 +1,18 @@
 from __future__ import annotations
+from functools import partial
+from jax import jit
 import jax
 import jax.numpy as jnp
 from jax import lax, vmap
 from mpx.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
-import time
+from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class SLSConfig:
+    max_sls_iterations: int = 2
+    sls_primal_tol: float = 1e-2
+
 
 @jax.jit
 def calculate_cost(Q_bar, R_bar, C, D, eta):
@@ -234,123 +243,106 @@ def get_etas(mus, betas, eps=1e-12):
     eta = jnp.maximum(eta, 0.0)
     return eta
 
-def make_dummy_problem(
-    T=5,
-    nx=4,
-    nu=2,
-    nc=3,
-    seed=0,
-    dtype=jnp.float32,
-):
-    key = jax.random.PRNGKey(seed)
-    keys = jax.random.split(key, 10)
+@jax.jit
+def _scaled_primal_diff(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """
+    Returns a scaled infinity-norm difference:
+        ||a-b||_inf / max(1, ||b||_inf)
+    """
+    num = jnp.max(jnp.abs(a - b))
+    den = jnp.maximum(1.0, jnp.max(jnp.abs(b)))
+    return num / (den + eps)
 
-    # -------------------------
-    # Dynamics: x_{k+1} = A_k x_k + B_k u_k
-    # -------------------------
-    A = []
-    B = []
-    for k in range(T):
-        Ak = (
-            0.95 * jnp.eye(nx, dtype=dtype)
-            + 0.05 * jax.random.normal(keys[0], (nx, nx), dtype=dtype)
+@jax.jit
+def primal_convergence_metric(
+    X_new: jnp.ndarray, U_new: jnp.ndarray,
+    X_old: jnp.ndarray, U_old: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Single scalar convergence metric = max of scaled diffs across primal blocks.
+    """
+    mX = _scaled_primal_diff(X_new, X_old)
+    mU = _scaled_primal_diff(U_new, U_old)
+    return jnp.maximum(mX, mU)
+
+@partial(jit, static_argnums=(0, 15))
+def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
+                       R: jnp.ndarray, r: jnp.ndarray,
+                       M: jnp.ndarray,
+                       A: jnp.ndarray, B: jnp.ndarray, c: jnp.ndarray,
+                       C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
+                       w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
+                       sls_config: SLSConfig, E: jnp.ndarray):
+    # Solve Nominal Trajectory
+    
+    Tp1 = Q.shape[0]
+    nx  = Q.shape[1]
+    nu  = R.shape[1]
+    nc  = w.shape[1]
+    T   = Tp1 - 1
+
+    beta0 = jnp.zeros((Tp1, T, nc)) * 1e-10
+    x0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
+    u0 = jnp.zeros((T, nu),  dtype=Q.dtype)
+    v0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
+
+    i0 = jnp.array(0, dtype=jnp.int32)
+    converged0 = jnp.array(False)
+
+    max_iter = jnp.array(sls_config.max_sls_iterations, dtype=jnp.int32)
+    tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
+
+    # carry = (i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, admm_converged)
+    carry0 = (i0, beta0, x0, u0, v0, w, y, rho, converged0, converged0)
+
+    def cond_fn(carry):
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _ = carry
+        return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
+
+    def body_fn(carry):
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _ = carry
+
+        prev_rho = rho
+        x_prev = x_curr
+        u_prev = u_curr
+
+        h_ct = get_constraint_tightenings(beta)
+        tightened_constraints = f - h_ct
+
+        x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
+            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints, w, y, rho
         )
-        Bk = 0.1 * jax.random.normal(keys[1], (nx, nu), dtype=dtype)
-        A.append(Ak)
-        B.append(Bk)
 
-    A = jnp.stack(A)  # [T,nx,nx]
-    B = jnp.stack(B)  # [T,nx,nu]
+        metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
+        converged_now = metric <= tol
 
-    # -------------------------
-    # Cost: quadratic LQR base
-    # -------------------------
-    Q = []
-    for k in range(T + 1):
-        Qk = jnp.eye(nx, dtype=dtype)
-        Q.append(Qk)
-    Q = jnp.stack(Q)  # [T+1,nx,nx]
+        def do_update(args):
+            beta, w, y, rho, prev_rho, mu = args
+            eta = get_etas(mu, beta)
+            Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
+            beta = get_betas(C, D, Phi_x, Phi_u)
 
-    R = []
-    for k in range(T):
-        Rk = 0.1 * jnp.eye(nu, dtype=dtype)
-        R.append(Rk)
-    R = jnp.stack(R)  # [T,nu,nu]
+            rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.9, 0.1)
+            y = prev_rho / rho * y
+            return beta, w, y, rho
 
-    # -------------------------
-    # Constraint Jacobians
-    #   g_k(x,u) = C_k x + D_k u
-    # -------------------------
-    C = []
-    D = []
-    for k in range(T + 1):
-        Ck = jax.random.normal(keys[2], (nc, nx), dtype=dtype)
-        Dk = jax.random.normal(keys[3], (nc, nu), dtype=dtype)
-        C.append(Ck)
-        D.append(Dk)
+        def skip_update(args):
+            beta, w, y, rho, prev_rho, mu = args
+            return beta, w, y, rho
 
-    C = jnp.stack(C)  # [T,nc,nx]
-    D = jnp.stack(D)  # [T,nc,nu]
+        beta, w, y, rho = jax.lax.cond(
+            converged_now,
+            skip_update,
+            do_update,
+            operand=(beta, w, y, rho, prev_rho, mu),
+        )
 
-    # -------------------------
-    # Disturbance injection matrix E
-    # Phi_x[j+1,j] = E[j]
-    # -------------------------
-    E = []
-    for k in range(T):
-        Ek = 0.1 * jnp.eye(nx, dtype=dtype)
-        E.append(Ek)
-    E = jnp.stack(E)  # [T,nx,nx]
+        converged = jnp.logical_or(converged, converged_now)
 
-    # -------------------------
-    # Dual weights eta[k,j,i] >= 0
-    # -------------------------
-    eta = jax.random.uniform(
-        keys[4],
-        shape=(T, T, nc),
-        minval=0.0,
-        maxval=1.0,
-        dtype=dtype,
-    )
-    mu_time = jnp.linspace(1.0, 2.0, T + 1, dtype=dtype)
-    key = jax.random.PRNGKey(0)
-    mus = 0.5 + jax.random.uniform(key, (T+1, nc), dtype=dtype)
-    return Q, R, A, B, C, D, E, eta, mus
+        return (i + jnp.array(1, dtype=jnp.int32),
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm)
 
-def main():
-    Q, R, A, B, C, D, E, eta, mus = make_dummy_problem(T=50, nx=61, nu=13, nc=10)
-    Phi_x, Phi_u = get_controller(
-        Q=Q,
-        R=R,
-        A=A,
-        B=B,
-        C=C,
-        D=D,
-        E=E,
-        eta=eta,
-    )
-    betas = get_betas(C, D, Phi_x, Phi_u)
-    h_ct  = get_constraint_tightenings(betas, eps_beta=1e-6)
-    eta = get_etas(mus, betas)
-    start = time.perf_counter()
-    Phi_x, Phi_u = get_controller(
-        Q=Q,
-        R=R,
-        A=A,
-        B=B,
-        C=C,
-        D=D,
-        E=E,
-        eta=eta,
-    )
-    betas = get_betas(C, D, Phi_x, Phi_u)
-    print(betas.shape)
-    h_ct  = get_constraint_tightenings(betas, eps_beta=1e-6)
-    eta = get_etas(mus, betas)
-    end = time.perf_counter()
-    print(end - start)
-    print(h_ct.shape)
+    carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
-
-if __name__ == '__main__':
-    main()
+    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm = carryN
+    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm
