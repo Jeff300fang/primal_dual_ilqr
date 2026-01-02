@@ -199,11 +199,16 @@ def compute_search_direction(
         w_init = jnp.zeros_like(w0)
         y_init = jnp.zeros_like(y0)
         rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
-
-        dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2 = fast_sls_solve_gpu(
-            cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
-            sls_config, E
-        )
+        if sls_config.enable_fastsls:
+            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2 = fast_sls_solve_gpu(
+                cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
+                sls_config, E
+            )
+        else:
+            dX2, dU2, dV2, w2, y2, rho2, mu, converged_admm2 = constrained_solve(
+                cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
+            )
+            conv2 = True
         return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2
 
     dX, dU, dV, w, y, rho, converged, converged_admm = lax.cond(

@@ -315,29 +315,14 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         )
 
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
+        eta = get_etas(mu, beta)
+        Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
+        beta = get_betas(C, D, Phi_x, Phi_u)
+
+        rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.9, 0.1)
+        y = prev_rho / rho * y
+
         converged_now = metric <= tol
-
-        def do_update(args):
-            beta, w, y, rho, prev_rho, mu = args
-            eta = get_etas(mu, beta)
-            Phi_x, Phi_u = get_controller(Q, R, A, B, C, D, E, eta)
-            beta = get_betas(C, D, Phi_x, Phi_u)
-
-            rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.9, 0.1)
-            y = prev_rho / rho * y
-            return beta, w, y, rho
-
-        def skip_update(args):
-            beta, w, y, rho, prev_rho, mu = args
-            return beta, w, y, rho
-
-        beta, w, y, rho = jax.lax.cond(
-            converged_now,
-            skip_update,
-            do_update,
-            operand=(beta, w, y, rho, prev_rho, mu),
-        )
-
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
