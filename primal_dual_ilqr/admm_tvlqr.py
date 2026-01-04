@@ -565,12 +565,11 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
         it = carry[0]
         converged = carry[-1]
         return jnp.logical_and(it < cfg.max_iterations, jnp.logical_not(converged))
-    
     T = A.shape[0]
     n = Q.shape[1]
     nx = Q.shape[-1]
     nu = R.shape[-1]
-
+    f = f - cfg.eps_abs
     # Pad terminal for consistency with x_{T} term
     R = jnp.concatenate([R, jnp.zeros((1, nu, nu), dtype=R.dtype)], axis=0)
     r = jnp.concatenate([r, jnp.zeros((1, nu), dtype=r.dtype)], axis=0)
@@ -604,7 +603,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     out = jax.lax.while_loop(cond_fun, one_iter, init)
 
     it, _, _, _, _, _, x_bar, u_bar, y_bar, w_bar, rho_final, _, _, _, P_final, p_final, _, rp_norm, rd_norm, eps_pri, eps_dual, converged = out
-
     v = dual_lqr(x_bar, P_final, p_final)
     jax.debug.print(
         "ADMM done: Total Iterations={} converged={} rho={:.3e} rp={:.3e} (<= {:.3e}) rd={:.3e} (<= {:.3e}) Rho0 {:.3e}",

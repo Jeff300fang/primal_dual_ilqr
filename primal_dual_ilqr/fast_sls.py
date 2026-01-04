@@ -30,11 +30,99 @@ def calculate_cost(Q_bar, R_bar, C, D, eta):
 
     return Cx, Cxu, Cu
 
+# @jax.jit
+# def calculate_phis(A, B, Cx, Cxu, Cu, E):
+#     """
+#     Same signature/outputs as calculate_phis, but removes the for-loop in (26)
+#     using lax.associative_scan to compute prefix products of F_{k,j} = A_k + B_k K_{k,j}.
+
+#     Args:
+#       A:   [T,nx,nx]
+#       B:   [T,nx,nu]
+#       Cx:  [T+1,T,nx,nx]
+#       Cxu: [T,T,nx,nu]
+#       Cu:  [T,T,nu,nu]
+#       E:   [T,nx,nx]
+
+#     Returns:
+#       Phi_x: [T+1,T,nx,nx]
+#       Phi_u: [T,T,nu,nx]
+#     """
+#     T, nx, _ = A.shape
+#     nu = B.shape[-1]
+
+#     zeros_q = jnp.zeros((T + 1, nx), dtype=A.dtype)
+#     zeros_r = jnp.zeros((T, nu), dtype=A.dtype)
+#     zeros_c = jnp.zeros((T, nx), dtype=A.dtype)
+
+#     # ---- 1) Riccati (unchanged): solve K_{k,j} for each j in parallel ----
+#     def solve_one_j(j):
+#         Qj = Cx[:, j, :, :]      # [T+1,nx,nx]
+#         Rj = Cu[:, j, :, :]      # [T,nu,nu]
+#         Mj = Cxu[:, j, :, :]     # [T,nx,nu]
+#         K, _, _, _ = tvlqr_gpu(Qj, zeros_q, Rj, zeros_r, Mj, A, B, zeros_c)
+#         return K                 # [T,nu,nx]
+
+#     # K_all: [T(j), T(k), nu, nx] -> swap to K_kj: [T(k), T(j), nu, nx]
+#     K_all = jax.vmap(solve_one_j)(jnp.arange(T))
+#     K_kj  = jnp.swapaxes(K_all, 0, 1)  # [T, T, nu, nx]
+
+#     # ---- 2) Build F_{k,j} = A_k + B_k K_{k,j}  ----
+#     # A[:,None,:,:] broadcasts over j
+#     # B[k] @ K[k,j] over j: einsum('x u, j u y -> j x y')
+#     BK = jnp.einsum("kxu,kjuy->kjxy", B, K_kj)          # [T,T,nx,nx]
+#     F  = A[:, None, :, :] + BK                          # [T,T,nx,nx]
+
+#     # ---- 3) Turn the lower-triangular recursion into prefix products ----
+#     # For each time t (0..T-1) and each j, define element:
+#     #   elem[t,j] = I   if t <= j
+#     #             = F[t,j] if t > j
+#     I = jnp.eye(nx, dtype=A.dtype)
+#     t_idx = jnp.arange(T)[:, None]   # [T,1]
+#     j_idx = jnp.arange(T)[None, :]   # [1,T]
+#     use_F = (t_idx > j_idx)          # [T,T]
+
+#     elems = jnp.where(use_F[:, :, None, None], F, I)  # [T,T,nx,nx]
+
+#     # Prefix product along time:
+#     # We want P[t] = elems[t] @ elems[t-1] @ ... @ elems[0] (chronological)
+#     # Using associative_scan with compose(l, r) = r @ l achieves that ordering.
+#     def compose(l, r):
+#         return jnp.einsum("...ab,...bc->...ac", r, l)
+
+#     P = lax.associative_scan(compose, elems, axis=0)  # [T,T,nx,nx]
+
+#     # Now, for k = 1..T:
+#     # Phi_x[k,j] = P[k-1,j] @ E[j]
+#     # (This gives Phi_x[j+1,j] = I @ E[j] automatically.)
+#     Phix_1toT = jnp.einsum("tjab,jbc->tjac", P, E)    # [T,T,nx,nx]
+#     Phi_x = jnp.concatenate(
+#         [jnp.zeros((1, T, nx, nx), dtype=A.dtype), Phix_1toT],
+#         axis=0,
+#     )  # [T+1,T,nx,nx]
+
+#     # Mask invalid entries where k <= j  (Phi_x is defined for k >= j+1)
+#     k_idx_full = jnp.arange(T + 1)[:, None]              # [T+1,1]
+#     valid_x = (k_idx_full >= (j_idx + 1))                # [T+1,T]
+#     Phi_x = Phi_x * valid_x[:, :, None, None]
+
+#     # ---- 4) Phi_u[k,j] = K[k,j] @ Phi_x[k,j] for k=0..T-1 ----
+#     # Use Phi_x at time k (not k+1), so slice Phi_x[:-1]
+#     Phi_u = jnp.einsum("kjux,kjxn->kjun", K_kj, Phi_x[:-1])  # [T,T,nu,nx]
+
+#     k_idx = jnp.arange(T)[:, None]                       # [T,1]
+#     valid_u = (k_idx >= (j_idx + 1))                     # [T,T]
+#     Phi_u = Phi_u * valid_u[:, :, None, None]
+
+#     return Phi_x, Phi_u
+
 @jax.jit
 def calculate_phis(A, B, Cx, Cxu, Cu, E):
     """
-    Same signature/outputs as calculate_phis, but removes the for-loop in (26)
-    using lax.associative_scan to compute prefix products of F_{k,j} = A_k + B_k K_{k,j}.
+    Corrected to match reference fast_SLS indexing:
+      Phi_x[j,j] = E[j]
+      Phi_u[j,j] = K[j,j] @ Phi_x[j,j]
+      Valid region: k >= j (not k >= j+1)
 
     Args:
       A:   [T,nx,nx]
@@ -42,11 +130,11 @@ def calculate_phis(A, B, Cx, Cxu, Cu, E):
       Cx:  [T+1,T,nx,nx]
       Cxu: [T,T,nx,nu]
       Cu:  [T,T,nu,nu]
-      E:   [T,nx,nx]
+      E:   [T,nx,nx]  (note: this assumes nw==nx; see note below)
 
     Returns:
-      Phi_x: [T+1,T,nx,nx]
-      Phi_u: [T,T,nu,nx]
+      Phi_x: [T+1,T,nx,nx]  where Phi_x[k,j] is defined for k>=j and k<=T
+      Phi_u: [T,T,nu,nx]    where Phi_u[k,j] is defined for k>=j and k<=T-1
     """
     T, nx, _ = A.shape
     nu = B.shape[-1]
@@ -55,7 +143,7 @@ def calculate_phis(A, B, Cx, Cxu, Cu, E):
     zeros_r = jnp.zeros((T, nu), dtype=A.dtype)
     zeros_c = jnp.zeros((T, nx), dtype=A.dtype)
 
-    # ---- 1) Riccati (unchanged): solve K_{k,j} for each j in parallel ----
+    # ---- 1) Riccati: solve K_{k,j} for each j ----
     def solve_one_j(j):
         Qj = Cx[:, j, :, :]      # [T+1,nx,nx]
         Rj = Cu[:, j, :, :]      # [T,nu,nu]
@@ -63,58 +151,61 @@ def calculate_phis(A, B, Cx, Cxu, Cu, E):
         K, _, _, _ = tvlqr_gpu(Qj, zeros_q, Rj, zeros_r, Mj, A, B, zeros_c)
         return K                 # [T,nu,nx]
 
-    # K_all: [T(j), T(k), nu, nx] -> swap to K_kj: [T(k), T(j), nu, nx]
-    K_all = jax.vmap(solve_one_j)(jnp.arange(T))
-    K_kj  = jnp.swapaxes(K_all, 0, 1)  # [T, T, nu, nx]
+    K_all = jax.vmap(solve_one_j)(jnp.arange(T))     # [T(j), T(k), nu, nx]
+    K_kj  = jnp.swapaxes(K_all, 0, 1)                # [T(k), T(j), nu, nx]
 
-    # ---- 2) Build F_{k,j} = A_k + B_k K_{k,j}  ----
-    # A[:,None,:,:] broadcasts over j
-    # B[k] @ K[k,j] over j: einsum('x u, j u y -> j x y')
-    BK = jnp.einsum("kxu,kjuy->kjxy", B, K_kj)          # [T,T,nx,nx]
-    F  = A[:, None, :, :] + BK                          # [T,T,nx,nx]
+    # ---- 2) Closed-loop F[t,j] ----
+    BK = jnp.einsum("kxu,kjuy->kjxy", B, K_kj)       # [T,T,nx,nx]
+    F  = A[:, None, :, :] + BK                       # [T,T,nx,nx]
 
-    # ---- 3) Turn the lower-triangular recursion into prefix products ----
-    # For each time t (0..T-1) and each j, define element:
-    #   elem[t,j] = I   if t <= j
-    #             = F[t,j] if t > j
+    # ---- 3) Prefix products that start at j (NOT at 0) ----
+    # We want Prod[k,j] = F[k-1,j] @ ... @ F[j,j]  for k>j, and identity for k==j.
+    #
+    # Build elems[t,j] = F[t,j] if t >= j else I
     I = jnp.eye(nx, dtype=A.dtype)
-    t_idx = jnp.arange(T)[:, None]   # [T,1]
-    j_idx = jnp.arange(T)[None, :]   # [1,T]
-    use_F = (t_idx > j_idx)          # [T,T]
-
+    t_idx = jnp.arange(T)[:, None]     # [T,1]
+    j_idx = jnp.arange(T)[None, :]     # [1,T]
+    use_F = (t_idx >= j_idx)           # include t=j
     elems = jnp.where(use_F[:, :, None, None], F, I)  # [T,T,nx,nx]
 
-    # Prefix product along time:
-    # We want P[t] = elems[t] @ elems[t-1] @ ... @ elems[0] (chronological)
-    # Using associative_scan with compose(l, r) = r @ l achieves that ordering.
+    # associative_scan over t computes:
+    #   P[t] = elems[t] @ elems[t-1] @ ... @ elems[0]
+    # For a given j:
+    #   if t < j: elems = I throughout => P[t,j]=I
+    #   if t >= j: P[t,j] = F[t,j] @ ... @ F[j,j]
     def compose(l, r):
         return jnp.einsum("...ab,...bc->...ac", r, l)
 
     P = lax.associative_scan(compose, elems, axis=0)  # [T,T,nx,nx]
 
-    # Now, for k = 1..T:
-    # Phi_x[k,j] = P[k-1,j] @ E[j]
-    # (This gives Phi_x[j+1,j] = I @ E[j] automatically.)
-    Phix_1toT = jnp.einsum("tjab,jbc->tjac", P, E)    # [T,T,nx,nx]
+    # Now map to Phi_x:
+    #   Phi_x[j,j]   = E[j]
+    #   Phi_x[k,j]   = P[k-1,j] @ E[j]   for k = 1..T
+    # BUT: this should be valid for k>=j.
+    Phix_1toT = jnp.einsum("tjab,jbc->tjac", P, E)    # [T,T,nx,nx] corresponds to k=t+1
     Phi_x = jnp.concatenate(
         [jnp.zeros((1, T, nx, nx), dtype=A.dtype), Phix_1toT],
         axis=0,
     )  # [T+1,T,nx,nx]
 
-    # Mask invalid entries where k <= j  (Phi_x is defined for k >= j+1)
-    k_idx_full = jnp.arange(T + 1)[:, None]              # [T+1,1]
-    valid_x = (k_idx_full >= (j_idx + 1))                # [T+1,T]
+    # Overwrite diagonal Phi_x[j,j] with E[j] explicitly.
+    # (This also fixes k=0,j=0 case properly.)
+    Phi_x = Phi_x.at[jnp.arange(T), jnp.arange(T)].set(E)
+
+    # Mask: Phi_x[k,j] valid for k >= j (reference includes k=j)
+    k_idx_full = jnp.arange(T + 1)[:, None]   # [T+1,1]
+    valid_x = (k_idx_full >= j_idx)           # [T+1,T]
     Phi_x = Phi_x * valid_x[:, :, None, None]
 
-    # ---- 4) Phi_u[k,j] = K[k,j] @ Phi_x[k,j] for k=0..T-1 ----
-    # Use Phi_x at time k (not k+1), so slice Phi_x[:-1]
+    # ---- 4) Phi_u[k,j] = K[k,j] @ Phi_x[k,j] for k=0..T-1, valid for k>=j ----
     Phi_u = jnp.einsum("kjux,kjxn->kjun", K_kj, Phi_x[:-1])  # [T,T,nu,nx]
 
-    k_idx = jnp.arange(T)[:, None]                       # [T,1]
-    valid_u = (k_idx >= (j_idx + 1))                     # [T,T]
+    k_idx = jnp.arange(T)[:, None]     # [T,1]
+    valid_u = (k_idx >= j_idx)         # include diagonal k=j
     Phi_u = Phi_u * valid_u[:, :, None, None]
 
     return Phi_x, Phi_u
+
 
 @jax.jit
 def get_controller(Q, R, A, B, C, D, E, eta):
@@ -282,7 +373,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     nc  = w.shape[1]
     T   = Tp1 - 1
 
-    beta0 = jnp.zeros((Tp1, T, nc)) * 1e-10
+    beta0 = jnp.ones((Tp1, T, nc)) * 1e-10
     x0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
     u0 = jnp.zeros((T, nu),  dtype=Q.dtype)
     v0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
@@ -294,14 +385,15 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     # carry = (i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, admm_converged)
-    carry0 = (i0, beta0, x0, u0, v0, w, y, rho, converged0, converged0)
+    h_ct0 = get_constraint_tightenings(beta0)
+    carry0 = (i0, beta0, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0)
 
     def cond_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _ = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, _ = carry
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _ = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, _ = carry
 
         prev_rho = rho
         x_prev = x_curr
@@ -309,7 +401,9 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
         h_ct = get_constraint_tightenings(beta)
         tightened_constraints = f - h_ct
-
+        w = jnp.zeros_like(w)
+        y = jnp.zeros_like(y)
+        rho = jnp.minimum(10.0, rho)
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints, w, y, rho
         )
@@ -326,9 +420,9 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm)
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
-    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm = carryN
-    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm
+    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct = carryN
+    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct

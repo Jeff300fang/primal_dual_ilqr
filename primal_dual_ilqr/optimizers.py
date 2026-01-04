@@ -181,7 +181,7 @@ def compute_search_direction(
 
     # Solve constrained QP for the SQP step (dX, dU)
     if sls_config.enable_fastsls:
-        dX, dU, dV, w, y, rho, converged, converged_admm = fast_sls_solve_gpu(
+        dX, dU, dV, w, y, rho, converged, converged_admm, backoffs = fast_sls_solve_gpu(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E
         )
     else:
@@ -192,7 +192,7 @@ def compute_search_direction(
 
     def converged_branch(state):
         # state = (w, y, rho)
-        return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm
+        return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm, backoffs
 
     def not_converged_branch(state):
         w0, y0, rho0 = state
@@ -200,7 +200,7 @@ def compute_search_direction(
         y_init = jnp.zeros_like(y0)
         rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
         if sls_config.enable_fastsls:
-            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2 = fast_sls_solve_gpu(
+            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs = fast_sls_solve_gpu(
                 cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
                 sls_config, E
             )
@@ -209,16 +209,17 @@ def compute_search_direction(
                 cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
             )
             conv2 = True
-        return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2
+            backoffs = None
+        return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs
 
-    dX, dU, dV, w, y, rho, converged, converged_admm = lax.cond(
+    dX, dU, dV, w, y, rho, converged, converged_admm, backoffs = lax.cond(
         converged_admm,
         converged_branch,
         not_converged_branch,
         operand=(w, y, rho),
     )
 
-    return dX, dU, dV, q, r, w, y, rho
+    return dX, dU, dV, q, r, w, y, rho, backoffs
 
 @jit
 def merit_rho(c, dV):
@@ -672,7 +673,7 @@ def mpc(
     U_curr = U_in
     V_curr = V_in
     g, c = model_evaluator(X_curr, U_curr)
-    dX, dU, dV, q, r, w, y, rho = compute_search_direction(
+    dX, dU, dV, q, r, w, y, rho, backoffs = compute_search_direction(
                 sls_config,
                 admm_config,
                 _cost,
@@ -691,7 +692,7 @@ def mpc(
     X_curr = X_curr + dX
     U_curr = U_curr + dU
     V_curr = V_curr + dV
-    return X_curr, U_curr, V_curr, w, y, rho
+    return X_curr, U_curr, V_curr, w, y, rho, backoffs
 
 
 @partial(jit, static_argnums=(0,1,2,3,4,5))
