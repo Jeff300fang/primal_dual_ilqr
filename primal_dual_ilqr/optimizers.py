@@ -176,7 +176,7 @@ def compute_search_direction(
     f = -g
 
     C, D = linearize(constraints)(X, U_pad, t)
-    E = disturbance(X[:-1])
+    E = disturbance(X)
     cfg = admm_config
 
     # Solve constrained QP for the SQP step (dX, dU)
@@ -189,6 +189,7 @@ def compute_search_direction(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
         )
         converged = True
+        backoffs = None
 
     def converged_branch(state):
         # state = (w, y, rho)
