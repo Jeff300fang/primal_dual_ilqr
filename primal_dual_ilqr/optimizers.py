@@ -180,9 +180,10 @@ def compute_search_direction(
     cfg = admm_config
 
     # Solve constrained QP for the SQP step (dX, dU)
+    # TODO: Correctly set Q_bar and R_bar?
     if sls_config.enable_fastsls:
-        dX, dU, dV, w, y, rho, converged, converged_admm, backoffs = fast_sls_solve_gpu(
-            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E
+        dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
+            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E, Q, R
         )
     else:
         dX, dU, dV, w, y, rho, _, converged_admm = constrained_solve(
@@ -201,9 +202,9 @@ def compute_search_direction(
         y_init = jnp.zeros_like(y0)
         rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
         if sls_config.enable_fastsls:
-            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs = fast_sls_solve_gpu(
+            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
                 cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
-                sls_config, E
+                sls_config, E, Q, R
             )
         else:
             dX2, dU2, dV2, w2, y2, rho2, mu, converged_admm2 = constrained_solve(
