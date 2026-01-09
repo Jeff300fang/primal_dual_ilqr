@@ -127,6 +127,67 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
+# def add_obstacle_constraints(C, D, f, obstacles, x_curr):
+#     Tp1 = C.shape[0]
+#     nx = C.shape[2]
+#     nu = D.shape[2]
+#     n_obstacles = obstacles.shape[0]
+#     C_obstacle = jnp.zeros((Tp1, n_obstacles, nx))
+#     D_obstacle = jnp.zeros((Tp1, n_obstacles, nu))
+#     f_obstacle = jnp.zeros((Tp1, n_obstacles))
+
+#     for i in range(Tp1):
+#         primal_pos = x_curr[i, :2]
+#         for j in range(n_obstacles):
+#             center = obstacles[j, :2]
+#             radius = obstacles[j, 2]
+
+#             dist = jnp.linalg.norm(primal_pos - center) + 1e-5
+#             x_coeff = -(primal_pos[0] - center[0]) / dist
+#             y_coeff = -(primal_pos[1] - center[1]) / dist
+#             C_obstacle = C_obstacle.at[i, j, 0].set(x_coeff)
+#             C_obstacle = C_obstacle.at[i, j, 1].set(y_coeff)
+#             upper_bound = jnp.linalg.norm(primal_pos - center) - radius
+#             f_obstacle = f_obstacle.at[i, j].set(upper_bound)
+#     C_all = jnp.concatenate([C, C_obstacle], axis=1)
+#     D_all = jnp.concatenate([D, D_obstacle], axis=1)
+#     f_all = jnp.concatenate([f, f_obstacle], axis=1)
+#     return C_all, D_all, f_all
+
+@jax.jit
+def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
+                             obstacles: jnp.ndarray, x_curr: jnp.ndarray, eps=1e-5):
+    if obstacles.shape[0] == 0:
+        return C, D, f
+
+    Tp1, _, nx = C.shape
+    _,  _, nu = D.shape
+
+    centers = obstacles[:, :2]
+    radii   = obstacles[:, 2]
+
+    pos = x_curr[:, :2]
+
+    diff = pos[:, None, :] - centers[None, :, :]
+
+    dist = jnp.linalg.norm(diff, axis=-1) + eps
+
+    n = diff / dist[..., None]
+
+    coeffs = -n
+
+    C_obstacle = jnp.zeros((Tp1, centers.shape[0], nx), dtype=C.dtype)
+    D_obstacle = jnp.zeros((Tp1, centers.shape[0], nu), dtype=D.dtype)
+
+    C_obstacle = C_obstacle.at[..., 0:2].set(coeffs)
+
+    f_obstacle = (dist - radii[None, :]).astype(f.dtype)
+
+    C_all = jnp.concatenate([C, C_obstacle], axis=1)
+    D_all = jnp.concatenate([D, D_obstacle], axis=1)
+    f_all = jnp.concatenate([f, f_obstacle], axis=1)
+    return C_all, D_all, f_all
+
 @partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 def compute_search_direction(
     sls_config: SLSConfig,
@@ -135,7 +196,7 @@ def compute_search_direction(
     dynamics,
     hessian_approx,
     limited_memory,
-    constraints, disturbance,
+    constraints, disturbance, obstacles,
     x0,
     X,
     U,
@@ -195,6 +256,8 @@ def compute_search_direction(
     f = -g
 
     C, D = linearize(constraints)(X, U_pad, t)
+
+    C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
     E = disturbance(X)
     cfg = admm_config
 
@@ -206,14 +269,14 @@ def compute_search_direction(
     # R_bar = R
     if sls_config.enable_fastsls:
         dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
-            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho, sls_config, E, Q_bar, R_bar
+            cfg, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, sls_config, E, Q_bar, R_bar, obstacles, X,
         )
     else:
         dX, dU, dV, w, y, rho, _, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
+            cfg, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho
         )
         converged = True
-        backoffs = jnp.zeros((T + 1, nc))
+        backoffs = jnp.zeros((T + 1, nc - obstacles.shape[0]))
         Phi_x = jnp.zeros((T + 1, T + 1, nx, nx))
         Phi_u = jnp.zeros((T, T + 1, nu, nx))
 
@@ -656,216 +719,6 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
 
     return g, c
 
-# @partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8))
-# def mpc(
-#     sls_config,
-#     sqp_config: SQPConfig,
-#     admm_config,
-#     cost,
-#     dynamics,
-#     hessian_approx,
-#     limited_mempory,
-#     constraints,
-#     disturbance,
-#     reference,
-#     parameter,
-#     W,
-#     x0,
-#     X_in,
-#     U_in,
-#     V_in,
-#     w,
-#     y,
-#     rho,
-#     ):
-
-#     _cost = partial(cost,W,reference)
-#     if hessian_approx is not None:
-#         _hessian_approx = partial(hessian_approx, W, reference)
-#     else:
-#         _hessian_approx = None
-#     _dynamics = partial(dynamics,parameter=parameter)
-#     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics,x0)
-#     X_curr = X_in
-#     U_curr = U_in
-#     V_curr = V_in
-#     g, c = model_evaluator(X_curr, U_curr)
-#     for i in range(sqp_config.max_sqp_iterations):
-#         w = jnp.zeros_like(w)
-#         y = jnp.zeros_like(y)
-#         rho = jnp.array(1.0)
-#         dX, dU, dV, q, r, w, y, rho, backoffs, Phi_x, Phi_u = compute_search_direction(
-#                     sls_config,
-#                     admm_config,
-#                     _cost,
-#                     _dynamics,
-#                     _hessian_approx,
-#                     limited_mempory,
-#                     constraints,
-#                     disturbance,
-#                     x0,
-#                     X_curr,
-#                     U_curr,
-#                     V_curr,
-#                     c,
-#                     w, y, rho
-#                 )
-#         X_curr = X_curr + dX
-#         U_curr = U_curr + dU
-#         V_curr = V_curr + dV
-#         g, c = model_evaluator(X_curr, U_curr)
-#     return X_curr, U_curr, V_curr, w, y, rho, backoffs, Phi_x, Phi_u
-
-@partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8))
-def mpc_old(
-    sls_config,
-    sqp_config: SQPConfig,
-    admm_config,
-    cost,
-    dynamics,
-    hessian_approx,
-    limited_mempory,
-    constraints,
-    disturbance,
-    reference,
-    parameter,
-    W,
-    x0,
-    X_in,
-    U_in,
-    V_in,
-    w,
-    y,
-    rho,
-):
-    Tp1 = X_in.shape[0]
-    nx = X_in.shape[1]
-    nu = U_in.shape[1]
-    nc = w.shape[1]
-    _cost = partial(cost, W, reference)
-    if hessian_approx is not None:
-        _hessian_approx = partial(hessian_approx, W, reference)
-    else:
-        _hessian_approx = None
-
-    _dynamics = partial(dynamics, parameter=parameter)
-    model_evaluator = partial(model_evaluator_helper, _cost, _dynamics, x0)
-
-    def body(i, carry):
-        X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u = carry
-
-        # If already converged, freeze state (no further work).
-        def do_nothing(_):
-            return carry
-
-        def do_iter(_):
-            # Evaluate current cost/constraints
-            g, c = model_evaluator(X_curr, U_curr)
-
-            feas = jnp.max(jnp.abs(c))
-
-            # Reset inner variables (kept as in your original code)
-            w0 = jnp.zeros_like(w)
-            y0 = jnp.zeros_like(y)
-            rho0 = jnp.array(0.0001)
-
-            # Compute SQP search direction
-            dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
-                sls_config,
-                admm_config,
-                _cost,
-                _dynamics,
-                _hessian_approx,
-                limited_mempory,
-                constraints,
-                disturbance,
-                x0,
-                X_curr,
-                U_curr,
-                V_curr,
-                c,
-                w0, y0, rho0
-            )
-
-            # Merit parameter and merit slope for Armijo
-            rho_merit = merit_rho(c, dV)
-
-            def merit_fn(V, g_val, c_val):
-                return g_val + jnp.sum(V * c_val) + 0.5 * rho_merit * jnp.sum(c_val * c_val)
-
-            current_merit = merit_fn(V_curr, g, c)
-            merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
-
-            # Parallel backtracking line search (fixed budget)
-            armijo_factor = 1e-4
-            X_ls, U_ls, V_ls, g_ls, c_ls = parallel_line_search(
-                merit_fn,
-                model_evaluator,
-                X_curr,
-                U_curr,
-                V_curr,
-                dX, dU, dV,
-                current_merit,
-                g,
-                c,
-                merit_slope,
-                armijo_factor,
-            )
-
-            # Step-size based convergence test (using the *accepted* step)
-            dX_acc = X_ls - X_curr
-            dU_acc = U_ls - U_curr
-            dV_acc = V_ls - V_curr
-
-            step = jnp.maximum(
-                jnp.max(jnp.abs(dX_acc)),
-                jnp.maximum(jnp.max(jnp.abs(dU_acc)), jnp.max(jnp.abs(dV_acc)))
-            )
-            z_norm = jnp.maximum(
-                jnp.max(jnp.abs(X_curr)),
-                jnp.maximum(jnp.max(jnp.abs(U_curr)), jnp.max(jnp.abs(V_curr)))
-            )
-
-            # Feasibility check should be on the *new* point if you are line-searching
-            feas_new = jnp.max(jnp.abs(c_ls))
-
-            feas_ok = feas_new <= sqp_config.feas_tol
-            step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
-            converged1 = jnp.logical_and(feas_ok, step_ok)
-
-            # Update iterates
-            X_next = lax.select(converged1, X_curr, X_ls)
-            U_next = lax.select(converged1, U_curr, U_ls)
-            V_next = lax.select(converged1, V_curr, V_ls)
-
-            w_next = lax.select(converged1, w, w1)
-            y_next = lax.select(converged1, y, y1)
-            rho_next = lax.select(converged1, rho, rho1)
-            backoffs_next = lax.select(converged1, backoffs, backoffs1)
-            Phi_x_next = lax.select(converged1, Phi_x, Phi_x1)
-            Phi_u_next = lax.select(converged1, Phi_u, Phi_u1)
-
-            return (X_next, U_next, V_next, w_next, y_next, rho_next,
-                    jnp.logical_or(converged, converged1),
-                    backoffs_next, Phi_x_next, Phi_u_next)
-
-
-        return lax.cond(converged, do_nothing, do_iter, operand=None)
-
-    # Initialize carry; backoffs/Phi_* placeholders must be valid JAX values
-    # If you have natural initial values, use them instead.
-    backoffs0 = jnp.zeros((Tp1, nc))
-    Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
-    Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
-
-    carry0 = (X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x0, Phi_u0)
-
-    X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u = lax.fori_loop(
-        0, sqp_config.max_sqp_iterations, body, carry0
-    )
-
-    return X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u
-
 
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8))
 def mpc(
@@ -888,6 +741,7 @@ def mpc(
     w,
     y,
     rho,
+    obstacles,
 ):
     Tp1 = X_in.shape[0]
     nx = X_in.shape[1]
@@ -921,7 +775,7 @@ def mpc(
             # w0 = w
             y0 = jnp.zeros_like(y)
             # y0 = y
-            rho0 = jnp.array(1.0)
+            rho0 = jnp.array(30.0)
             # rho0 = rho
             # Compute search direction
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
@@ -933,6 +787,7 @@ def mpc(
                 limited_mempory,
                 constraints,
                 disturbance,
+                obstacles,
                 x0,
                 X_curr,
                 U_curr,
@@ -976,7 +831,7 @@ def mpc(
 
     # Initialize carry; backoffs/Phi_* placeholders must be valid JAX values
     # If you have natural initial values, use them instead.
-    backoffs0 = jnp.zeros((Tp1, nc))
+    backoffs0 = jnp.zeros((Tp1, nc - obstacles.shape[0]))
     Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
     Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
 

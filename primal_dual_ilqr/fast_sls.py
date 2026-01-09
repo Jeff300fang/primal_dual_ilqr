@@ -15,7 +15,6 @@ class SLSConfig:
     enable_fastsls: bool = True
 
 
-@jax.jit
 def calculate_cost(Q_bar, R_bar, C, D, eta):
     eta = jnp.asarray(eta).reshape(-1)
     eta = jnp.maximum(eta, 0.0)
@@ -165,7 +164,7 @@ def get_constraint_tightenings(betas, eps_beta=1e-6):
     betas: [T+1, T+1, nc]
     h_ct[k] = sum_{j=0}^{k-1} sqrt(betas[k,j,:]) + eps_beta
     """
-    T1, T1b, nc = betas.shape
+    T1, _, _ = betas.shape
 
     s = jnp.sqrt(jnp.maximum(betas, 0.0))  # [T+1, T+1, nc]
 
@@ -184,7 +183,6 @@ def get_constraint_tightenings(betas, eps_beta=1e-6):
 def get_etas(mus, betas, eps=1e-12):
     Tp1 = mus.shape[0]
     T = Tp1 - 1
-    nc = mus.shape[1]
 
     # stage eta[k,j,:] = mu[k,:] / (2*sqrt(beta[k,j,:]))
     mu_k = mus[:-1]                    # [T, nc]
@@ -225,6 +223,42 @@ def primal_convergence_metric(
     mU = _scaled_primal_diff(U_new, U_old)
     return jnp.maximum(mX, mU)
 
+# def add_obstacle_tightenings(obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct: jnp.ndarray):
+#     Tp1 = h_ct.shape[0]
+#     num_obstacles = obstacles.shape[0]
+#     h_ct_obstacle = jnp.zeros((Tp1, num_obstacles))
+#     for i in range(Tp1):
+#         pos = primal_pos[i, :2]
+#         for j in range(num_obstacles):
+#             over_approx = jnp.sqrt(h_ct[i, 0] ** 2 + h_ct[i, 1] ** 2)
+#             center = obstacles[j, :2]
+#             radius = obstacles[j, 2]
+#             tightened = jnp.linalg.norm(pos - center) - radius - over_approx
+#             h_ct_obstacle = h_ct_obstacle.at[i, j].set(tightened)
+#     h_ct_all = jnp.concatenate([h_ct, h_ct_obstacle], axis=1)
+#     return h_ct_all
+
+def add_obstacle_tightenings(
+    obstacles: jnp.ndarray,
+    primal_pos: jnp.ndarray,
+    h_ct: jnp.ndarray,
+    tightened_constraints: jnp.ndarray,
+    idx_px: int = 0,
+    idx_py: int = 1,
+):
+    pos = primal_pos[:, :2]
+    centers = obstacles[:, :2]
+    radii = obstacles[:, 2]
+
+    over = jnp.sqrt(h_ct[:, idx_px]**2 + h_ct[:, idx_py]**2)
+
+    dist = jnp.linalg.norm(pos[:, None, :] - centers[None, :, :], axis=-1)
+
+    tightened = dist - radii[None, :] - over[:, None]
+    tightened_all = jnp.concatenate([tightened_constraints, tightened], axis=1)
+    return tightened_all
+
+
 @partial(jit, static_argnums=(0, 15))
 def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
                        R: jnp.ndarray, r: jnp.ndarray,
@@ -232,16 +266,18 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
                        A: jnp.ndarray, B: jnp.ndarray, c: jnp.ndarray,
                        C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
-                       sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray):
+                       sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
+                       obstacles: jnp.ndarray, primal_pos: jnp.ndarray):
     # Solve Nominal Trajectory
     
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
     nc  = w.shape[1]
+    num_obstacles = obstacles.shape[0]
     T   = Tp1 - 1
 
-    beta0 = jnp.ones((Tp1, Tp1, nc), dtype=Q.dtype) * 1e-10
+    beta0 = jnp.ones((Tp1, Tp1, nc - num_obstacles), dtype=Q.dtype) * 1e-10
     x0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
     u0 = jnp.zeros((T, nu),  dtype=Q.dtype)
     v0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
@@ -253,7 +289,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     # carry = (i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, admm_converged)
-    h_ct0 = get_constraint_tightenings(beta0)
+    h_ct0 = jnp.zeros((Tp1, nc - num_obstacles))
     Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
     Phi_u0 = jnp.zeros((T, Tp1, nu, nx))
     carry0 = (i0, beta0, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x0, Phi_u0)
@@ -269,18 +305,22 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         x_prev = x_curr
         u_prev = u_curr
 
-        tightened_constraints = f - h_ct
+        tightened_constraints = f[:, :-num_obstacles] - h_ct
+        tightened_constraints_all = add_obstacle_tightenings(obstacles, primal_pos, h_ct, tightened_constraints)
         # w = jnp.zeros_like(w)
         # y = jnp.zeros_like(y)
         # rho = jnp.minimum(0.1, rho)
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
-            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints, w, y, rho
+            cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
 
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
-        eta_stage, eta_f = get_etas(mu, beta)
-        Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C, D, E, eta_stage, eta_f)
-        beta = get_betas(C, D, Phi_x, Phi_u)
+        mu_nominal = mu[: , :-num_obstacles]
+        eta_stage, eta_f = get_etas(mu_nominal, beta)
+        C_box = C[:, :nc - num_obstacles, :]
+        D_box = D[:, :nc - num_obstacles, :]
+        Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
+        beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
 
         rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.5, 0.1)
