@@ -163,7 +163,7 @@ def compute_search_direction(
       r: [T, m]    numpy array.
     """
     T = U.shape[0]
-
+    nc = w.shape[1]
     pad = lambda A: jnp.pad(A, [[0, 1], [0, 0]])
 
     if hessian_approx is None:
@@ -213,40 +213,41 @@ def compute_search_direction(
             cfg, Q, q, R, r, M, A, B, c, C, D, f, w, y, rho
         )
         converged = True
-        backoffs = None
+        backoffs = jnp.zeros((T + 1, nc))
         Phi_x = jnp.zeros((T + 1, T + 1, nx, nx))
         Phi_u = jnp.zeros((T, T + 1, nu, nx))
 
-    def converged_branch(state):
-        # state = (w, y, rho)
-        return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm, backoffs, Phi_x, Phi_u
+    # def converged_branch(state):
+    #     # state = (w, y, rho)
+    #     return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm, backoffs, Phi_x, Phi_u
 
-    def not_converged_branch(state):
-        w0, y0, rho0 = state
-        w_init = jnp.zeros_like(w0)
-        y_init = jnp.zeros_like(y0)
-        rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
-        if sls_config.enable_fastsls:
-            dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
-                cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
-                sls_config, E, Q, R
-            )
-        else:
-            dX2, dU2, dV2, w2, y2, rho2, mu, converged_admm2 = constrained_solve(
-                cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
-            )
-            conv2 = True
-            backoffs = None
-            Phi_x = jnp.zeros((T + 1, T + 1, nx, nx))
-            Phi_u = jnp.zeros((T, T + 1, nu, nx))
-        return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs, Phi_x, Phi_u
+    # def not_converged_branch(state):
+    #     return dX, dU, dV, state[0], state[1], state[2], converged, converged_admm, backoffs, Phi_x, Phi_u
+    #     w0, y0, rho0 = state
+    #     w_init = jnp.zeros_like(w0)
+    #     y_init = jnp.zeros_like(y0)
+    #     rho_init = jnp.asarray(0.1, dtype=rho0.dtype)
+    #     if sls_config.enable_fastsls:
+    #         dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
+    #             cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init,
+    #             sls_config, E, Q, R
+    #         )
+    #     else:
+    #         dX2, dU2, dV2, w2, y2, rho2, mu, converged_admm2 = constrained_solve(
+    #             cfg, Q, q, R, r, M, A, B, c, C, D, f, w_init, y_init, rho_init
+    #         )
+    #         conv2 = True
+    #         backoffs = jnp.zeros((T + 1, nc))
+    #         Phi_x = jnp.zeros((T + 1, T + 1, nx, nx))
+    #         Phi_u = jnp.zeros((T, T + 1, nu, nx))
+    #     return dX2, dU2, dV2, w2, y2, rho2, conv2, converged_admm2, backoffs, Phi_x, Phi_u
 
-    dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = lax.cond(
-        converged_admm,
-        converged_branch,
-        not_converged_branch,
-        operand=(w, y, rho),
-    )
+    # dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = lax.cond(
+    #     converged_admm,
+    #     converged_branch,
+    #     not_converged_branch,
+    #     operand=(w, y, rho),
+    # )
 
     return dX, dU, dV, q, r, w, y, rho, backoffs, Phi_x, Phi_u
 
@@ -766,7 +767,7 @@ def mpc_old(
             # Reset inner variables (kept as in your original code)
             w0 = jnp.zeros_like(w)
             y0 = jnp.zeros_like(y)
-            rho0 = jnp.array(1.0)
+            rho0 = jnp.array(0.0001)
 
             # Compute SQP search direction
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
@@ -868,7 +869,7 @@ def mpc_old(
 
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8))
 def mpc(
-    sls_config,
+    sls_config: SLSConfig,
     sqp_config: SQPConfig,
     admm_config,
     cost,
@@ -917,9 +918,11 @@ def mpc(
 
             # Reset inner variables (kept as in your original code)
             w0 = jnp.zeros_like(w)
+            # w0 = w
             y0 = jnp.zeros_like(y)
+            # y0 = y
             rho0 = jnp.array(1.0)
-
+            # rho0 = rho
             # Compute search direction
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
                 sls_config,
@@ -978,7 +981,6 @@ def mpc(
     Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
 
     carry0 = (X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x0, Phi_u0)
-
     X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u = lax.fori_loop(
         0, sqp_config.max_sqp_iterations, body, carry0
     )

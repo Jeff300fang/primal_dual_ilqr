@@ -92,11 +92,18 @@ def _combine_acp_all(next_block, prev_block, n):
     C_r = next_block[:, n:2*n, :]
     P_r = next_block[:, 2*n:3*n, :]
 
-    inv1 = jnp.linalg.inv(I + C_l @ P_r)
-    inv2 = jnp.linalg.inv(I + P_r @ C_l)
+    # inv1 = jnp.linalg.inv(I + C_l @ P_r)
+    # inv2 = jnp.linalg.inv(I + P_r @ C_l)
 
-    Ar = A_r @ inv1
-    Al = jnp.swapaxes(A_l, -1, -2) @ inv2
+    # Ar = A_r @ inv1
+    # Al = jnp.swapaxes(A_l, -1, -2) @ inv2
+    M1 = I + C_l @ P_r              # (T,n,n)
+    M2 = I + P_r @ C_l              # (T,n,n)
+    Ar = jnp.swapaxes(jnp.linalg.solve(jnp.swapaxes(M1, -1, -2),
+                                  jnp.swapaxes(A_r, -1, -2)), -1, -2)
+
+    # Al = A_l^T @ inv(M2) -> Al^T = solve(M2^T, A_l)
+    Al = jnp.swapaxes(jnp.linalg.solve(jnp.swapaxes(M2, -1, -2), A_l), -1, -2)
 
     ArC = Ar @ C_l
     AlP = Al @ P_r
@@ -375,20 +382,18 @@ def adaptive_rho_update(rp_norm, rd_norm, rho,
 
     updated = rho_new != rho
     return rho_new, updated
+    
+# def adaptive_rho_update(rp, rd, rho,
+#                         mu=10.0, tau=5.0,
+#                         rho_min=1e-3, rho_max=1e5):
+#     inc = rp > mu * rd
+#     dec = rd > mu * rp
+#     rho_new = jnp.where(inc, rho * tau, rho)
+#     rho_new = jnp.where(dec, rho / tau, rho_new)
+#     rho_new = jnp.clip(rho_new, rho_min, rho_max)
+#     updated = rho_new != rho
+#     return rho_new, updated
 
-def compute_Ginv(R, B, P):
-    """
-    Returns Ginv: (T, nu, nu)
-    """
-    T, nu, _ = R.shape
-    Iu = jnp.eye(nu, dtype=R.dtype)
-
-    def one(t):
-        G = R[t] + B[t].T @ P[t+1] @ B[t]
-        # Ginv = solve(G, I)
-        return jnp.linalg.solve(G, Iu)
-
-    return vmap(one)(jnp.arange(T))
 
 def rho_update_y(rp_norm, rd_norm, rho, y, rho_max):
     rho_new, updated = adaptive_rho_update(rp_norm, rd_norm, rho, rho_max=rho_max)
@@ -400,22 +405,44 @@ def rho_update_y(rp_norm, rd_norm, rho, y, rho_max):
     )
     return rho_new, y_new, updated
 
-def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B):
+def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B, reg=1e-8):
     T = tilde_Q.shape[0] - 1
     n = tilde_Q.shape[1]
-    def chol_inv(t):
-        Rt = 0.5 * (tilde_R[t] + tilde_R[t].T)
-        Rt = Rt + 1e-8 * jnp.eye(Rt.shape[0], dtype=Rt.dtype)
-        I = jnp.eye(tilde_R[t].shape[0])
-        Rinv = jnp.linalg.solve(Rt, I)
-        return Rinv
-        # f = scipy.linalg.cho_factor(tilde_R[t])
-        # m = tilde_R[t].shape[0]
-        # return scipy.linalg.cho_solve(f, jnp.eye(m))
+    nu = tilde_R.shape[-1]
+    # def chol_inv(t):
+    #     Rt = 0.5 * (tilde_R[t] + tilde_R[t].T)
+    #     Rt = Rt + 1e-8 * jnp.eye(Rt.shape[0], dtype=Rt.dtype)
+    #     I = jnp.eye(tilde_R[t].shape[0])
+    #     Rinv = jnp.linalg.solve(Rt, I)
+    #     return Rinv
+    #     # f = scipy.linalg.cho_factor(tilde_R[t])
+    #     # m = tilde_R[t].shape[0]
+    #     # return scipy.linalg.cho_solve(f, jnp.eye(m))
 
-    Rinv = vmap(chol_inv)(jnp.arange(T))
-    BRinv = vmap(lambda t: B[t] @ Rinv[t])(jnp.arange(T))
-    MRinv = vmap(lambda t: tilde_M[t] @ Rinv[t])(jnp.arange(T))
+    # Rinv = vmap(chol_inv)(jnp.arange(T))
+    # BRinv = vmap(lambda t: B[t] @ Rinv[t])(jnp.arange(T))
+    # MRinv = vmap(lambda t: tilde_M[t] @ Rinv[t])(jnp.arange(T))
+
+    def make_R(t):
+        Rt = 0.5 * (tilde_R[t] + tilde_R[t].T)
+        Rt = Rt + reg * jnp.eye(nu, dtype=Rt.dtype)
+        return Rt
+
+    def solve_right(Rt, X):
+        return jnp.linalg.solve(Rt.T, X.T).T
+
+    def one(t):
+        Rt = make_R(t)
+
+        # BRinv[t] = B[t] @ inv(Rt)
+        BR = solve_right(Rt, B[t])            # (n, nu)
+
+        # MRinv[t] = tilde_M[t] @ inv(Rt)
+        MR = solve_right(Rt, tilde_M[t])      # (n, nu)
+
+        return BR, MR
+
+    BRinv, MRinv = vmap(one)(jnp.arange(T))
 
     elems = jnp.concatenate(
         [
@@ -446,6 +473,7 @@ def generate_leaf(tilde_Q, tilde_R, tilde_M, A, B):
     )
 
     return elems, BRinv, MRinv
+
 def generate_leaf_bp(c, BRinv, MRinv, tilde_r, tilde_q, T, n):
     # c: (T, n)   where this is c[1:] in your caller
     # tilde_q: (T+1, n)

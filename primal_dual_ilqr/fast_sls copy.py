@@ -21,8 +21,8 @@ def calculate_cost(Q_bar, R_bar, C, D, eta):
     eta = jnp.maximum(eta, 0.0)
 
     s = jnp.sqrt(eta)
-    Cs = C * s[:, None]
-    Ds = D * s[:, None]
+    Cs = C[:-1] * s[:, None]
+    Ds = D[:-1] * s[:, None]
 
     Cx  = Cs.T @ Cs + Q_bar
     Cxu = Cs.T @ Ds
@@ -32,6 +32,11 @@ def calculate_cost(Q_bar, R_bar, C, D, eta):
 
 @jax.jit
 def calculate_phis(A, B, Cx, Cxu, Cu, E):
+    """
+    Same as your current associative-scan version, but robust to accidentally
+    passing A/B with length T+1. Ensures Phi_u has leading dimension T (stage length).
+    """
+    # Define stage horizon from Cu (or B) which should be length T
     T = Cu.shape[0]                 # stage length
     nx = A.shape[1]
     nu = B.shape[-1]
@@ -118,9 +123,9 @@ def get_controller(Q, R, A, B, C, D, E, eta_stage, eta_f):
 
     Cx_kj, Cxu_kj, Cu_kj = vmap(blocks_for_k)(ks)  # [T,T,...]
 
-    Cterm = C[-1]  # [nc, nx]
+    Cterm = C[-1, :-1]  # [nc, nx]
     def terminal_Cx_for_j(j):
-        w = eta_f[j]
+        w = eta_f[j]  # <-- correct indexing by j
         return (Cterm.T * w[None, :]) @ Cterm + Q[T]
 
     Cx_Nj = vmap(terminal_Cx_for_j)(jnp.arange(T))  # [T, nx, nx]
@@ -131,25 +136,39 @@ def get_controller(Q, R, A, B, C, D, E, eta_stage, eta_f):
 
 @jax.jit
 def get_betas(C, D, Phi_x, Phi_u):
+    """
+    Shape-consistent with fixed phis.
+
+    C:     [T+1, nc, nx]
+    D:     [T,   nc, nu]
+    Phi_x: [T+1, T+1, nx, nw]
+    Phi_u: [T,   T+1, nu, nw]
+
+    Returns:
+      beta: [T+1, T+1, nc]  (we’ll fill stage rows k=0..T-1, terminal row k=T)
+            Downstream can still slice as needed.
+    """
     T = Phi_u.shape[0]
     Tp1 = T + 1
-    nc = C.shape[1]
+    nc = C.shape[1] - 1
 
     # Stage: k=0..T-1
     # term_x[k,j,i,:] = C[k,i] @ Phi_x[k,j]
-    term_x = jnp.einsum("kix,kjxn->kjin", C[:-1], Phi_x[:-1])  # [T, T+1, nc, nw]
+    term_x = jnp.einsum("kix,kjxn->kjin", C[:-1, :-1], Phi_x[:-1])  # [T, T+1, nc, nw]
     # term_u[k,j,i,:] = D[k,i] @ Phi_u[k,j]
-    term_u = jnp.einsum("kiu,kjun->kjin", D[:-1], Phi_u)            # [T, T+1, nc, nw]
+    term_u = jnp.einsum("kiu,kjun->kjin", D[:-1, :-1], Phi_u)            # [T, T+1, nc, nw]
     gPhi = term_x + term_u
     beta_stage = jnp.sum(gPhi * gPhi, axis=-1)                 # [T, T+1, nc]
 
+    # Mask invalid entries (j > k) to 0 to keep your triangular structure
     k_idx = jnp.arange(T)[:, None]          # [T,1]
     j_idx = jnp.arange(Tp1)[None, :]        # [1,T+1]
     mask = (j_idx <= k_idx)                 # [T, T+1]
     beta_stage = beta_stage * mask[:, :, None]
 
+    # Terminal row (k=T): only state constraints contribute (no D at terminal)
     # beta_term[j,i] = || C[T,i] @ Phi_x[T,j] ||^2
-    gPhi_term = jnp.einsum("ix,jxn->jin", C[-1], Phi_x[-1])    # [T+1, nc, nw]
+    gPhi_term = jnp.einsum("ix,jxn->jin", C[-1, :-1], Phi_x[-1])    # [T+1, nc, nw]
     beta_term = jnp.sum(gPhi_term * gPhi_term, axis=-1)        # [T+1, nc]
 
     # Pack into one tensor like your old code expects.
@@ -166,6 +185,7 @@ def get_constraint_tightenings(betas, eps_beta=1e-6):
     h_ct[k] = sum_{j=0}^{k-1} sqrt(betas[k,j,:]) + eps_beta
     """
     T1, T1b, nc = betas.shape
+    # sanity: T1b == T1
 
     s = jnp.sqrt(jnp.maximum(betas, 0.0))  # [T+1, T+1, nc]
 
@@ -175,19 +195,31 @@ def get_constraint_tightenings(betas, eps_beta=1e-6):
     s = s * valid[:, :, None]
 
     h_ct = jnp.sum(s, axis=1)              # [T+1, nc]
+    # return h_ct
     h_ct = h_ct + eps_beta
-    # h_ct = h_ct.at[0].set(jnp.zeros((nc,), dtype=h_ct.dtype))
-    # jax.debug.print("{}", h_ct)
-    return h_ct
+    h_ct_xy = jnp.sqrt(
+        h_ct[:, 0] ** 2 + h_ct[:, 1] ** 2
+    )[:, None]                                      # [T+1, 1]
+
+    return jnp.concatenate([h_ct, h_ct_xy], axis=1) # [T+1, nc+1]
 
 @jax.jit
 def get_etas(mus, betas, eps=1e-12):
+    """
+    Drop-in signature: (mus, betas, eps) -> (eta, eta_f)
+
+    mus:   [T+1, nc]         (inequality multipliers per time, terminal at mus[T])
+    betas: [T+1, T+1, nc]    (beta[T, j, :] is terminal beta_f[j])
+
+    Returns:
+      eta:   [T,   T,   nc]   for stage costs (k=0..T-1, j=0..T-1)
+      eta_f: [T+1,      nc]   for terminal boundary (j=0..T)
+    """
     Tp1 = mus.shape[0]
     T = Tp1 - 1
-    nc = mus.shape[1]
 
     # stage eta[k,j,:] = mu[k,:] / (2*sqrt(beta[k,j,:]))
-    mu_k = mus[:-1]                    # [T, nc]
+    mu_k = mus[:-1, :-1]                    # [T, nc]
     beta_kj = betas[:-1, :-1, :]       # [T, T, nc]
     eta = (mu_k[:, None, :] /
            (2.0 * jnp.sqrt(jnp.maximum(beta_kj, eps))))
@@ -198,8 +230,8 @@ def get_etas(mus, betas, eps=1e-12):
     eta = jnp.maximum(eta, 0.0)
 
     # terminal eta_f[j,:] = mu_f / (2*sqrt(beta_f[j,:]))
-    mu_f = mus[-1]                     # [nc]
-    beta_f = betas[-1, :, :]
+    mu_f = mus[-1, :-1]                     # [nc]
+    beta_f = betas[-1, :, :]           # [T+1, nc]  <-- terminal row k=T
     eta_f = (mu_f[None, :] /
              (2.0 * jnp.sqrt(jnp.maximum(beta_f, eps))))
     eta_f = jnp.maximum(eta_f, 0.0)    # [T+1, nc]
@@ -221,6 +253,9 @@ def primal_convergence_metric(
     X_new: jnp.ndarray, U_new: jnp.ndarray,
     X_old: jnp.ndarray, U_old: jnp.ndarray
 ) -> jnp.ndarray:
+    """
+    Single scalar convergence metric = max of scaled diffs across primal blocks.
+    """
     mX = _scaled_primal_diff(X_new, X_old)
     mU = _scaled_primal_diff(U_new, U_old)
     return jnp.maximum(mX, mU)
@@ -238,7 +273,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
-    nc  = w.shape[1]
+    nc  = w.shape[1] - 1
     T   = Tp1 - 1
 
     beta0 = jnp.ones((Tp1, Tp1, nc), dtype=Q.dtype) * 1e-10
@@ -263,34 +298,59 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _ = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x, Phi_u = carry
 
         prev_rho = rho
         x_prev = x_curr
         u_prev = u_curr
 
         tightened_constraints = f - h_ct
-        # w = jnp.zeros_like(w)
-        # y = jnp.zeros_like(y)
-        # rho = jnp.minimum(0.1, rho)
+
+        # (your reset logic)
+        w = jnp.zeros_like(w)
+        y = jnp.zeros_like(y)
+        rho = jnp.array(10)
+
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints, w, y, rho
         )
 
         metric = primal_convergence_metric(x_curr, u_curr, x_prev, u_prev)
-        eta_stage, eta_f = get_etas(mu, beta)
-        Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C, D, E, eta_stage, eta_f)
-        beta = get_betas(C, D, Phi_x, Phi_u)
-        h_ct = get_constraint_tightenings(beta)
+        converged_now = metric <= tol
 
+        # If we are converged, skip eta/controller/beta/tightening updates.
+        def do_updates(args):
+            beta, h_ct, Phi_x, Phi_u, mu = args
+
+            eta_stage, eta_f = get_etas(mu, beta)
+            Phi_x_new, Phi_u_new = get_controller(Q_bar, R_bar, A, B, C, D, E, eta_stage, eta_f)
+            beta_new = get_betas(C, D, Phi_x_new, Phi_u_new)
+            h_ct_new = get_constraint_tightenings(beta_new)
+
+            return beta_new, h_ct_new, Phi_x_new, Phi_u_new
+
+        def skip_updates(args):
+            beta, h_ct, Phi_x, Phi_u, mu = args
+            return beta, h_ct, Phi_x, Phi_u
+
+        beta, h_ct, Phi_x, Phi_u = lax.cond(
+            converged_now,
+            skip_updates,
+            do_updates,
+            (beta, h_ct, Phi_x, Phi_u, mu),
+        )
+
+        # (your rho/y scaling logic)
         rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.5, 0.1)
         y = prev_rho / rho * y
 
-        converged_now = metric <= tol
         converged = jnp.logical_or(converged, converged_now)
 
-        return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u)
+        return (
+            i + jnp.array(1, dtype=jnp.int32),
+            beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm,
+            h_ct, Phi_x, Phi_u
+        )
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
