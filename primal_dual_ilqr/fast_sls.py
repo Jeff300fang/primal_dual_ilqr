@@ -307,9 +307,9 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
         tightened_constraints = f[:, :-num_obstacles] - h_ct
         tightened_constraints_all = add_obstacle_tightenings(obstacles, primal_pos, h_ct, tightened_constraints)
-        # w = jnp.zeros_like(w)
-        # y = jnp.zeros_like(y)
-        # rho = jnp.minimum(0.1, rho)
+        w = jnp.zeros_like(w)
+        y = jnp.zeros_like(y)
+        rho = jnp.array(30.0)
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )

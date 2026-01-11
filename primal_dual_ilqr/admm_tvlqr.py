@@ -372,16 +372,24 @@ def adaptive_rho_update(rp_norm, rd_norm, rho,
     """
 
     # Residual ratio as scaling factor
-    scale = rp_norm / (rd_norm + eps)
+    # scale = rp_norm / (rd_norm + eps)
 
-    # Clip scaling factor
-    scale = jnp.clip(scale, clip_min, clip_max)
+    # # Clip scaling factor
+    # scale = jnp.clip(scale, clip_min, clip_max)
 
-    # Update rho with hard bounds
+    # # Update rho with hard bounds
+    # rho_new = jnp.clip(rho * scale, rho_min, rho_max)
+
+
+    rd_eff = jnp.maximum(rd_norm, 1e-10)
+    # scale = jnp.sqrt(rp_norm / rd_eff)
+    scale = jnp.sqrt(rp_norm / rd_eff)
+    # scale = (rp_norm / rd_eff) ** 0.5
+    scale = jnp.clip(scale, 0.5, 2.0)
     rho_new = jnp.clip(rho * scale, rho_min, rho_max)
-
     updated = rho_new != rho
     return rho_new, updated
+    
     
 # def adaptive_rho_update(rp, rd, rho,
 #                         mu=10.0, tau=5.0,
@@ -529,11 +537,10 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
             jnp.einsum('tmi,ti->tm', C, x_bar) +
             jnp.einsum('tmi,ti->tm', D, u_bar)
         )
-
         # -------- Project onto constraint set -------- 
         w_new = jnp.minimum(z_bar + y_bar, f)
 
-        # -------- Dual update (scaled form) -------- 
+        # # -------- Dual update (scaled form) -------- 
         y_new = y_bar + (z_bar - w_new)
 
 

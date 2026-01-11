@@ -127,33 +127,6 @@ def lagrangian(cost, dynamics, x0):
 
     return fun
 
-# def add_obstacle_constraints(C, D, f, obstacles, x_curr):
-#     Tp1 = C.shape[0]
-#     nx = C.shape[2]
-#     nu = D.shape[2]
-#     n_obstacles = obstacles.shape[0]
-#     C_obstacle = jnp.zeros((Tp1, n_obstacles, nx))
-#     D_obstacle = jnp.zeros((Tp1, n_obstacles, nu))
-#     f_obstacle = jnp.zeros((Tp1, n_obstacles))
-
-#     for i in range(Tp1):
-#         primal_pos = x_curr[i, :2]
-#         for j in range(n_obstacles):
-#             center = obstacles[j, :2]
-#             radius = obstacles[j, 2]
-
-#             dist = jnp.linalg.norm(primal_pos - center) + 1e-5
-#             x_coeff = -(primal_pos[0] - center[0]) / dist
-#             y_coeff = -(primal_pos[1] - center[1]) / dist
-#             C_obstacle = C_obstacle.at[i, j, 0].set(x_coeff)
-#             C_obstacle = C_obstacle.at[i, j, 1].set(y_coeff)
-#             upper_bound = jnp.linalg.norm(primal_pos - center) - radius
-#             f_obstacle = f_obstacle.at[i, j].set(upper_bound)
-#     C_all = jnp.concatenate([C, C_obstacle], axis=1)
-#     D_all = jnp.concatenate([D, D_obstacle], axis=1)
-#     f_all = jnp.concatenate([f, f_obstacle], axis=1)
-#     return C_all, D_all, f_all
-
 @jax.jit
 def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
                              obstacles: jnp.ndarray, x_curr: jnp.ndarray, eps=1e-5):
@@ -187,6 +160,7 @@ def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
     D_all = jnp.concatenate([D, D_obstacle], axis=1)
     f_all = jnp.concatenate([f, f_obstacle], axis=1)
     return C_all, D_all, f_all
+
 
 @partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 def compute_search_direction(
@@ -258,6 +232,7 @@ def compute_search_direction(
     C, D = linearize(constraints)(X, U_pad, t)
 
     C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
+
     E = disturbance(X)
     cfg = admm_config
 
@@ -757,7 +732,7 @@ def mpc(
     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics, x0)
 
     def body(i, carry):
-        X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u = carry
+        i, X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u = carry
 
         # If already converged, freeze state (no further work).
         def do_nothing(_):
@@ -799,15 +774,16 @@ def mpc(
             # Convergence criterion 2: relative step size (infinity norm)
             step = jnp.maximum(
                 jnp.max(jnp.abs(dX)),
-                jnp.maximum(jnp.max(jnp.abs(dU)), jnp.max(jnp.abs(dV)))
+                jnp.max(jnp.abs(dU))
             )
             z_norm = jnp.maximum(
                 jnp.max(jnp.abs(X_curr)),
-                jnp.maximum(jnp.max(jnp.abs(U_curr)), jnp.max(jnp.abs(V_curr)))
+                jnp.max(jnp.abs(U_curr))
             )
 
             feas_ok = feas <= sqp_config.feas_tol
             step_ok = step <= sqp_config.step_tol * (1.0 + z_norm)
+            jax.debug.print("SQP Iteration {} Feas {} (<= {}) Step {} (<= {})", i, feas, sqp_config.feas_tol, step, sqp_config.step_tol)
             converged1 = jnp.logical_and(feas_ok, step_ok)
 
             # Only apply the step if not converged
@@ -823,7 +799,7 @@ def mpc(
             Phi_x_next = lax.select(converged1, Phi_x, Phi_x1)
             Phi_u_next = lax.select(converged1, Phi_u, Phi_u1)
 
-            return (X_next, U_next, V_next, w_next, y_next, rho_next,
+            return (i + 1, X_next, U_next, V_next, w_next, y_next, rho_next,
                     jnp.logical_or(converged, converged1),
                     backoffs_next, Phi_x_next, Phi_u_next)
 
@@ -835,8 +811,8 @@ def mpc(
     Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
     Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
 
-    carry0 = (X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x0, Phi_u0)
-    X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u = lax.fori_loop(
+    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x0, Phi_u0)
+    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u = lax.fori_loop(
         0, sqp_config.max_sqp_iterations, body, carry0
     )
 
