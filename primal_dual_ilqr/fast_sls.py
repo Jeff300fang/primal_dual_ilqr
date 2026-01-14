@@ -267,7 +267,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
                        C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
                        sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
-                       obstacles: jnp.ndarray, primal_pos: jnp.ndarray):
+                       obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray):
     # Solve Nominal Trajectory
     
     Tp1 = Q.shape[0]

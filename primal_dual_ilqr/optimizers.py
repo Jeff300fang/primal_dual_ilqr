@@ -177,6 +177,7 @@ def compute_search_direction(
     V,
     c,
     w, y, rho,
+    h_ct_ws,
 ):
     """Computes the SQP search direction.
 
@@ -244,7 +245,7 @@ def compute_search_direction(
     # R_bar = R
     if sls_config.enable_fastsls:
         dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
-            cfg, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, sls_config, E, Q_bar, R_bar, obstacles, X,
+            cfg, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, sls_config, E, Q_bar, R_bar, obstacles, X, h_ct_ws,
         )
     else:
         dX, dU, dV, w, y, rho, _, converged_admm = constrained_solve(
@@ -717,6 +718,7 @@ def mpc(
     y,
     rho,
     obstacles,
+    h_ct_ws,
 ):
     Tp1 = X_in.shape[0]
     nx = X_in.shape[1]
@@ -747,12 +749,13 @@ def mpc(
 
             # Reset inner variables (kept as in your original code)
             w0 = jnp.zeros_like(w)
-            # w0 = w
             y0 = jnp.zeros_like(y)
-            # y0 = y
             rho0 = jnp.array(30.0)
+            # w0 = w
+            # y0 = y
             # rho0 = rho
             # Compute search direction
+            h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
                 sls_config,
                 admm_config,
@@ -768,7 +771,8 @@ def mpc(
                 U_curr,
                 V_curr,
                 c,
-                w0, y0, rho0
+                w0, y0, rho0,
+                h_ct_ws
             )
 
             # Convergence criterion 2: relative step size (infinity norm)
@@ -807,7 +811,7 @@ def mpc(
 
     # Initialize carry; backoffs/Phi_* placeholders must be valid JAX values
     # If you have natural initial values, use them instead.
-    backoffs0 = jnp.zeros((Tp1, nc - obstacles.shape[0]))
+    backoffs0 = h_ct_ws
     Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
     Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
 
