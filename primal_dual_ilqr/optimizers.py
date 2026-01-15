@@ -17,9 +17,10 @@ class SQPConfig:
     max_sqp_iterations: int = 1
     feas_tol: float = 1e-2
     step_tol: float = 1e-4
+    warm_start: bool = True
 
     def tree_flatten(self):
-        children = (self.max_sqp_iterations, self.feas_tol, self.step_tol)
+        children = (self.max_sqp_iterations, self.feas_tol, self.step_tol, self.warm_start)
         return children, None
 
     @classmethod
@@ -748,12 +749,11 @@ def mpc(
             feas = jnp.max(jnp.abs(c))
 
             # Reset inner variables (kept as in your original code)
-            w0 = jnp.zeros_like(w)
-            y0 = jnp.zeros_like(y)
-            rho0 = jnp.array(30.0)
-            # w0 = w
-            # y0 = y
-            # rho0 = rho
+            warm_flag = jnp.array(bool(sqp_config.warm_start))  # safe because sqp_config is static
+
+            w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
+            y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
+            rho0 = lax.select(warm_flag, rho, jnp.array(30.0))
             # Compute search direction
             h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
@@ -794,6 +794,26 @@ def mpc(
             X_next = lax.select(converged1, X_curr, X_curr + dX)
             U_next = lax.select(converged1, U_curr, U_curr + dU)
             V_next = lax.select(converged1, V_curr, V_curr + dV)
+
+            g, c = model_evaluator(X_curr, U_curr)
+
+            rho_merit = merit_rho(c, dV)          # or keep fixed
+            merit_fn  = merit_function_factory(rho_merit)
+            current_merit = merit_fn(V_curr, g, c)
+
+            merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
+
+            X_next, U_next, V_next, g_new, c_new, ok = line_search(
+                merit_fn, model_evaluator,
+                X_curr, U_curr, V_curr,
+                dX, dU, dV,
+                current_merit, g, c,
+                merit_slope,
+                armijo_factor=1e-4,
+                alpha_0=1.0,
+                alpha_mult=0.5,
+                alpha_min=1e-6,
+            )
 
             # Keep the latest aux outputs; if converged, keep prior ones
             w_next = lax.select(converged1, w, w1)

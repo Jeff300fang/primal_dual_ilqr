@@ -13,6 +13,7 @@ class SLSConfig:
     max_sls_iterations: int = 2
     sls_primal_tol: float = 1e-2
     enable_fastsls: bool = True
+    warm_start: bool = True
 
 
 def calculate_cost(Q_bar, R_bar, C, D, eta):
@@ -307,9 +308,11 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
         tightened_constraints = f[:, :-num_obstacles] - h_ct
         tightened_constraints_all = add_obstacle_tightenings(obstacles, primal_pos, h_ct, tightened_constraints)
-        w = jnp.zeros_like(w)
-        y = jnp.zeros_like(y)
-        rho = jnp.array(30.0)
+        warm_flag = jnp.array(bool(sls_config.warm_start))  # safe because sqp_config is static
+
+        w   = lax.select(warm_flag, w, jnp.zeros_like(w))
+        y   = lax.select(warm_flag, y, jnp.zeros_like(y))
+        rho = lax.select(warm_flag, rho, jnp.array(30.0))
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
@@ -327,7 +330,9 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         y = prev_rho / rho * y
 
         converged_now = metric <= tol
+        not_first = (i != 0)
         converged = jnp.logical_or(converged, converged_now)
+        converged = jnp.logical_and(converged, not_first)
 
         return (i + jnp.array(1, dtype=jnp.int32),
                 beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u)
