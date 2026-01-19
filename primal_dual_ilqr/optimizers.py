@@ -803,17 +803,17 @@ def mpc(
 
             merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
 
-            X_next, U_next, V_next, g_new, c_new, ok = line_search(
-                merit_fn, model_evaluator,
-                X_curr, U_curr, V_curr,
-                dX, dU, dV,
-                current_merit, g, c,
-                merit_slope,
-                armijo_factor=1e-4,
-                alpha_0=1.0,
-                alpha_mult=0.5,
-                alpha_min=1e-6,
-            )
+            # X_next, U_next, V_next, g_new, c_new, ok = line_search(
+            #     merit_fn, model_evaluator,
+            #     X_curr, U_curr, V_curr,
+            #     dX, dU, dV,
+            #     current_merit, g, c,
+            #     merit_slope,
+            #     armijo_factor=1e-4,
+            #     alpha_0=1.0,
+            #     alpha_mult=0.5,
+            #     alpha_min=1e-6,
+            # )
 
             # Keep the latest aux outputs; if converged, keep prior ones
             w_next = lax.select(converged1, w, w1)
