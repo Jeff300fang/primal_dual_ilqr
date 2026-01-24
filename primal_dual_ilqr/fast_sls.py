@@ -290,7 +290,8 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     # carry = (i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, admm_converged)
-    h_ct0 = jnp.zeros((Tp1, nc - num_obstacles))
+    # h_ct0 = jnp.zeros((Tp1, nc - num_obstacles))
+    h_ct0 = h_ct_ws
     Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
     Phi_u0 = jnp.zeros((T, Tp1, nu, nx))
     carry0 = (i0, beta0, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x0, Phi_u0)
@@ -326,7 +327,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
 
-        rho = jnp.maximum(jnp.minimum(rho, 1e3) * 0.5, 0.1)
+        rho = jnp.maximum(jnp.minimum(rho, 1e4) * 0.9, 0.1)
         y = prev_rho / rho * y
 
         converged_now = metric <= tol

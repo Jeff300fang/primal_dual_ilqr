@@ -753,7 +753,7 @@ def mpc(
 
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
-            rho0 = lax.select(warm_flag, rho, jnp.array(30.0))
+            rho0 = lax.select(warm_flag, rho, jnp.asarray(30.0))
             # Compute search direction
             h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
@@ -839,7 +839,6 @@ def mpc(
     total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u = lax.fori_loop(
         0, sqp_config.max_sqp_iterations, body, carry0
     )
-
     return X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u
 
 
