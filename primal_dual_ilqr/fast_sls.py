@@ -4,8 +4,8 @@ from jax import jit
 import jax
 import jax.numpy as jnp
 from jax import lax, vmap
-from mpx.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
-from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
+from quad_mpc_constrained.mpx.mpx.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
+from quad_mpc_constrained.mpx.mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
