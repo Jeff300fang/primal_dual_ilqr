@@ -1,5 +1,4 @@
 from jax import debug, grad, jit, lax, scipy, vmap
-
 import jax.numpy as np
 
 from functools import partial
@@ -7,24 +6,64 @@ from functools import partial
 from trajax.optimizers import evaluate, linearize, quadratize
 
 from .kkt_helpers import compute_search_direction_kkt, tvlqr_kkt
-
 from .dual_tvlqr import dual_lqr, dual_lqr_backward, dual_lqr_gpu
-
 from .linalg_helpers import (
     invert_symmetric_positive_definite_matrix,
     project_psd_cone,
 )
-
 from .primal_tvlqr import tvlqr, tvlqr_gpu, rollout, rollout_gpu
 
 
+# -----------------------------
+# dtype helpers
+# -----------------------------
+def _dtype_of(*xs, default=np.float32):
+    """Pick a reasonable floating dtype from any provided arrays/scalars."""
+    for x in xs:
+        if hasattr(x, "dtype"):
+            dt = x.dtype
+            if dt in (np.float16, np.bfloat16, np.float32, np.float64):
+                return dt
+    return default
+
+
+def _as_dtype(x, dtype):
+    return np.asarray(x, dtype=dtype)
+
+
+def _fconst(val, dtype):
+    """Typed floating constant."""
+    return np.asarray(val, dtype=dtype)
+
+
+# -----------------------------
+# Lagrangian + regularization
+# -----------------------------
 def lagrangian(cost, dynamics, x0):
     """Returns a function to evaluate the associated Lagrangian."""
 
     def fun(x, u, t, v, v_prev):
-        c1 = cost(x, u, t)
-        c2 = np.dot(v, dynamics(x, u, t))
-        c3 = np.dot(v_prev, lax.select(t == 0, x0 - x, -x))
+        # Force everything involved in arithmetic to a consistent dtype (use x.dtype).
+        dt = x.dtype
+        x0_ = _as_dtype(x0, dt)
+        v_ = _as_dtype(v, dt)
+        vprev_ = _as_dtype(v_prev, dt)
+
+        c1 = cost(x, u, t)                     # should already be dt
+        c1 = _as_dtype(c1, dt)
+
+        dyn = dynamics(x, u, t)
+        dyn = _as_dtype(dyn, dt)
+        c2 = np.dot(v_, dyn)
+
+        # IMPORTANT: lax.select does NOT promote; both branches must match dtype.
+        sel = lax.select(
+            t == 0,
+            (x0_ - x).astype(dt),
+            (-x).astype(dt),
+        )
+        c3 = np.dot(vprev_, sel)
+
         return c1 + c2 + c3
 
     return fun
@@ -32,37 +71,32 @@ def lagrangian(cost, dynamics, x0):
 
 @jit
 def regularize(Q, R, M, make_psd, psd_delta):
-    """Regularizes the Q and R matrices.
-
-    Args:
-      Q:             [T+1, n, n]      numpy array.
-      R:             [T, m, m]        numpy array.
-      M:             [T+1, n, m]      numpy array.
-      make_psd:      whether to zero negative eigenvalues after quadratization.
-      psd_delta:     the minimum eigenvalue post PSD cone projection.
-
-    Returns:
-      Q:             [T+1, n, n]      numpy array.
-      R:             [T, m, m]        numpy array.
-    """
+    """Regularizes the Q and R matrices."""
     T, n, m = M.shape
+    dt = Q.dtype
+
     psd = vmap(partial(project_psd_cone, delta=psd_delta))
 
-    # This is done to ensure that the R are positive definite.
+    # Ensure R is PSD/PD as requested.
     R = lax.cond(make_psd, psd, lambda x: x, R)
 
-    # This is done to ensure that the Q - M R^(-1) M^T are positive semi-definite.
+    # Ensure Q - M R^{-1} M^T is PSD as requested.
     Rinv = vmap(lambda t: invert_symmetric_positive_definite_matrix(R[t]))(np.arange(T))
     MRinvMT = vmap(lambda t: M[t] @ Rinv[t] @ M[t].T)(np.arange(T))
     QMRinvMT = vmap(lambda t: Q[t] - MRinvMT[t])(np.arange(T))
     QMRinvMT = lax.cond(make_psd, psd, lambda x: x, QMRinvMT)
+
     Q_T = Q[T].reshape([1, n, n])
     Q_T = lax.cond(make_psd, psd, lambda x: x, Q_T)
-    Q = np.concatenate([QMRinvMT + MRinvMT, Q_T])
+
+    Q = np.concatenate([QMRinvMT + MRinvMT, Q_T]).astype(dt)
 
     return Q, R
 
 
+# -----------------------------
+# Search direction
+# -----------------------------
 @partial(jit, static_argnums=(0, 1))
 def compute_search_direction(
     cost,
@@ -75,31 +109,26 @@ def compute_search_direction(
     make_psd,
     psd_delta,
 ):
-    """Computes the SQP search direction.
-
-    Args:
-      cost:          cost function with signature cost(x, u, t).
-      dynamics:      dynamics function with signature dynamics(x, u, t).
-      x0:            [n]           numpy array.
-      X:             [T+1, n]      numpy array.
-      U:             [T, m]        numpy array.
-      V:             [T+1, n]      numpy array.
-      c:             [T+1, n]      numpy array.
-      make_psd:      whether to zero negative eigenvalues after quadratization.
-      psd_delta:     the minimum eigenvalue post PSD cone projection.
-
-    Returns:
-      dX: [T+1, n] numpy array.
-      dU: [T, m]   numpy array.
-      q: [T+1, n]  numpy array.
-      r: [T, m]    numpy array.
-    """
+    """Computes the SQP search direction."""
     T = U.shape[0]
+    dt = X.dtype
+
+    # Normalize all inputs to X.dtype (critical: avoids float32/float64 mixes).
+    x0 = _as_dtype(x0, dt)
+    X = _as_dtype(X, dt)
+    U = _as_dtype(U, dt)
+    V = _as_dtype(V, dt)
+    c = _as_dtype(c, dt)
 
     pad = lambda A: np.pad(A, [[0, 1], [0, 0]])
 
+    # Trajax quadratize/linearize will follow the dtype of the computation graph.
     quadratizer = quadratize(lagrangian(cost, dynamics, x0), argnums=5)
     Q, R_pad, M_pad = quadratizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
+
+    Q = _as_dtype(Q, dt)
+    R_pad = _as_dtype(R_pad, dt)
+    M_pad = _as_dtype(M_pad, dt)
 
     R = R_pad[:-1]
     M = M_pad[:-1]
@@ -108,69 +137,63 @@ def compute_search_direction(
 
     linearizer = linearize(lagrangian(cost, dynamics, x0), argnums=5)
     q, r_pad = linearizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
+
+    q = _as_dtype(q, dt)
+    r_pad = _as_dtype(r_pad, dt)
     r = r_pad[:-1]
 
     dynamics_linearizer = linearize(dynamics)
     A_pad, B_pad = dynamics_linearizer(X, pad(U), np.arange(T + 1))
-    A = A_pad[:-1]
-    B = B_pad[:-1]
+    A = _as_dtype(A_pad[:-1], dt)
+    B = _as_dtype(B_pad[:-1], dt)
 
-    # K, k, P, p = tvlqr(Q, q, R, r, M, A, B, c[1:])
+    # GPU tvlqr/rollout
     K, k, P, p = tvlqr_gpu(Q, q, R, r, M, A, B, c[1:])
-    # dX, dU = rollout(K, k, c[0], A, B, c[1:])
     dX, dU = rollout_gpu(K, k, c[0], A, B, c[1:])
     dV = dual_lqr(dX, P, p)
-    # debug.print("Here")
-    # dV = dual_lqr_backward(Q, q, M, A, dX, dU)
-    # dV = dual_lqr_gpu(Q, q, M, A, dX, dU)
 
-    # new_dX, new_dU, new_dV, LHS, rhs = tvlqr_kkt(Q, q, R, r, M, A, B, c[1:], c[0])
-
-    # candidate_sol = np.concatenate([dX.flatten(), dU.flatten(), dV.flatten()])
-    # candidate_sol = np.concatenate([new_dX.flatten(), new_dU.flatten(), new_dV.flatten()])
-    # error = LHS @ candidate_sol - rhs
-    # debug.print(f"error_norm={np.linalg.norm(error)}")
-
-    # return new_dX, new_dU, new_dV, q, r
+    # Normalize outputs
+    dX = _as_dtype(dX, dt)
+    dU = _as_dtype(dU, dt)
+    dV = _as_dtype(dV, dt)
 
     return dX, dU, dV, q, r
 
 
+# -----------------------------
+# Merit function components
+# -----------------------------
 @jit
 def merit_rho(c, dV):
-    """Determines the merit function penalty parameter to be used.
+    """Determines the merit function penalty parameter to be used."""
+    dt = c.dtype
+    c2 = np.sum(c * c).astype(dt)
+    dV2 = np.sum(dV * dV).astype(dt)
 
-    Args:
-      c:             [T+1, n]  numpy array.
-      dV:            [T+1, n]  numpy array.
+    eps = _fconst(1e-12, dt)
+    two = _fconst(2.0, dt)
+    small = _fconst(1e-2, dt)
 
-    Returns:
-        rho: the penalty parameter.
-    """
-    c2 = np.sum(c * c)
-    dV2 = np.sum(dV * dV)
-    return lax.select(c2 > 1e-12, 2.0 * np.sqrt(dV2 / c2), 1e-2)
+    # Use where/select with typed constants; keep dtype stable.
+    return np.where(c2 > eps, two * np.sqrt(dV2 / c2), small).astype(dt)
 
 
 @jit
 def slope(dX, dU, dV, c, q, r, rho):
-    """Determines the directional derivative of the merit function.
-
-    Args:
-      dX: [T+1, n] numpy array.
-      dU: [T, m]   numpy array.
-      dV: [T+1, n] numpy array.
-      c:  [T+1, n] numpy array.
-      q:  [T+1, n] numpy array.
-      r:  [T, m] numpy array.
-      rho: the penalty parameter of the merit function.
-
-    Returns:
-        dir_derivative: the directional derivative.
-    """
-    return np.sum(q * dX) + np.sum(r * dU) + np.sum(dV * c) - rho * np.sum(c * c)
+    """Directional derivative of the merit function."""
+    dt = dX.dtype
+    rho = _as_dtype(rho, dt)
+    return (
+        np.sum(q * dX)
+        + np.sum(r * dU)
+        + np.sum(dV * c)
+        - rho * np.sum(c * c)
+    ).astype(dt)
 
 
+# -----------------------------
+# Line search
+# -----------------------------
 @partial(jit, static_argnums=(0, 1))
 def line_search(
     merit_function,
@@ -190,37 +213,20 @@ def line_search(
     alpha_mult,
     alpha_min,
 ):
-    """Performs a primal-dual line search on an augmented Lagrangian merit function.
+    """Performs a primal-dual line search on an augmented Lagrangian merit function."""
+    dt = X_in.dtype
 
-    Args:
-      merit_function:  merit function mapping V, g, c to the merit scalar.
-      X_in:            [T+1, n]      numpy array.
-      U_in:            [T, m]        numpy array.
-      V_in:            [T+1, n]      numpy array.
-      dX:              [T+1, n]      numpy array.
-      dU:              [T, m]        numpy array.
-      dV:              [T+1, n]      numpy array.
-      current_merit:   the merit function value at X, U, V.
-      current_g:       the cost value at X, U, V.
-      current_c:       the constraint values at X, U, V.
-      merit_slope:     the directional derivative of the merit function.
-      armijo_factor:   the Armijo parameter to be used in the line search.
-      alpha_0:         initial line search value.
-      alpha_mult:      a constant in (0, 1) that gets multiplied to alpha to update it.
-      alpha_min:       minimum line search value.
+    # Typed scalars (alpha-related comparisons in lax.while_loop are dtype-sensitive).
+    armijo_factor = _fconst(armijo_factor, dt)
+    alpha_0 = _fconst(alpha_0, dt)
+    alpha_mult = _fconst(alpha_mult, dt)
+    alpha_min = _fconst(alpha_min, dt)
 
-    Returns:
-      X: [T+1, n]     numpy array, representing the optimal state trajectory.
-      U: [T, m]       numpy array, representing the optimal control trajectory.
-      V: [T+1, n]     numpy array, representing the optimal multiplier trajectory.
-      new_g:          the cost value at the new X, U, V.
-      new_c:          the constraint values at the new X, U, V.
-      no_errors:       whether no error occurred during the line search.
-    """
+    current_merit = _as_dtype(current_merit, dt)
+    merit_slope = _as_dtype(merit_slope, dt)
 
     def continuation_criterion(inputs):
         _, _, _, _, _, new_merit, alpha = inputs
-        # debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")
         return np.logical_and(
             new_merit > current_merit + alpha * armijo_factor * merit_slope,
             alpha > alpha_min,
@@ -228,56 +234,66 @@ def line_search(
 
     def body(inputs):
         _, _, _, _, _, _, alpha = inputs
-        alpha *= alpha_mult
+        alpha = (alpha * alpha_mult).astype(dt)
+
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
         V_new = V_in + alpha * dV
+
         new_g, new_c = model_evaluator(X_new, U_new)
+        new_g = _as_dtype(new_g, dt)
+        new_c = _as_dtype(new_c, dt)
+
         new_merit = merit_function(V_new, new_g, new_c)
-        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
+        new_merit = _as_dtype(new_merit, dt)
+
+        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit).astype(dt)
         return X_new, U_new, V_new, new_g, new_c, new_merit, alpha
+
+    inf = _fconst(np.inf, dt)
 
     X, U, V, new_g, new_c, _, alpha = lax.while_loop(
         continuation_criterion,
         body,
-        (X_in, U_in, V_in, current_g, current_c, np.inf, alpha_0 / alpha_mult),
+        (X_in, U_in, V_in, current_g, current_c, inf, alpha_0 / alpha_mult),
     )
-
-    # debug.print(
-    #     f"{new_g=}, c_sq_norm={np.sum(new_c * new_c)}, {merit_slope=}, {alpha=}"
-    # )
 
     no_errors = alpha > alpha_min
 
     return X, U, V, new_g, new_c, no_errors
 
 
+# -----------------------------
+# Model evaluator
+# -----------------------------
 @partial(jit, static_argnums=(0, 1))
 def model_evaluator_helper(cost, dynamics, x0, X, U):
-    """Evaluates the costs and constraints based on the provided primal variables.
+    """Evaluates the costs and constraints based on the provided primal variables."""
+    dt = X.dtype
+    x0 = _as_dtype(x0, dt)
+    X = _as_dtype(X, dt)
+    U = _as_dtype(U, dt)
 
-    Args:
-      cost:            cost function with signature cost(x, u, t).
-      dynamics:        dynamics function with signature dynamics(x, u, t).
-      x0:              [n]           numpy array.
-      X:               [T+1, n]      numpy array.
-      U:               [T, m]        numpy array.
-
-    Returns:
-      g: the cost value (a scalar).
-      c: the constraint values (a [T+1, n] numpy array).
-    """
     T = U.shape[0]
 
     costs = partial(evaluate, cost)
     g = np.sum(costs(X, np.pad(U, [[0, 1], [0, 0]])))
+    g = _as_dtype(g, dt)
 
-    residual_fn = lambda t: dynamics(X[t], U[t], t) - X[t + 1]
+    def residual_fn(t):
+        dyn = dynamics(X[t], U[t], t)
+        dyn = _as_dtype(dyn, dt)
+        return dyn - X[t + 1]
+
     c = np.vstack([x0 - X[0], vmap(residual_fn)(np.arange(T))])
+    c = _as_dtype(c, dt)
 
     return g, c
 
 
+# -----------------------------
+# Main primal-dual iLQR
+# -----------------------------
 @partial(jit, static_argnums=(0, 1))
 def primal_dual_ilqr(
     cost,
@@ -297,54 +313,31 @@ def primal_dual_ilqr(
     alpha_mult=0.5,
     alpha_min=5e-5,
 ):
-    """Implements the Primal-Dual iLQR algorithm.
+    """Implements the Primal-Dual iLQR algorithm."""
 
-    Args:
-      cost:            cost function with signature cost(x, u, t).
-      dynamics:        dynamics function with signature dynamics(x, u, t).
-      x0:              [n]           numpy array.
-      X_in:            [T+1, n]      numpy array.
-      U_in:            [T, m]        numpy array.
-      V_in:            [T+1, n]      numpy array.
-      max_iterations:  maximum iterations.
-      slope_threshold: tolerance for stopping optimization.
-      var_threshold:   tolerance on primal and dual variables for stopping optimization.
-      c_sq_threshold:  tolerance on squared constraint violations for stopping optimization.
-      make_psd:        whether to zero negative eigenvalues after quadratization.
-      psd_delta:       the minimum eigenvalue post PSD cone projection.
-      armijo_factor:   the Armijo parameter to be used in the line search.
-      alpha_0:         initial line search value.
-      alpha_mult:      a constant in (0, 1) that gets multiplied to alpha to update it.
-      alpha_min:       minimum line search value.
+    # Choose a single dtype and normalize everything to it.
+    dt = _dtype_of(X_in, U_in, V_in, x0, default=np.float32)
+    X_in = _as_dtype(X_in, dt)
+    U_in = _as_dtype(U_in, dt)
+    V_in = _as_dtype(V_in, dt)
+    x0 = _as_dtype(x0, dt)
 
-    Returns:
-      X: [T+1, n]        numpy array, representing the optimal state trajectory.
-      U: [T, m]          numpy array, representing the optimal control trajectory.
-      V: [T+1, n]        numpy array, representing the optimal multiplier trajectory.
-      num_iterations:    the number of iterations upon convergence.
-      final_cost:        the cost at the optimal state and control trajectory.
-      final_constraints: the constraints at the optimal state and control trajectory.
-      no_errors:         whether no errors were encountered during the solve.
-    """
+    # Typed thresholds/constants used inside while_loop conditions.
+    slope_threshold = _fconst(slope_threshold, dt)
+    var_threshold = _fconst(var_threshold, dt)
+    c_sq_threshold = _fconst(c_sq_threshold, dt)
+
     model_evaluator = partial(model_evaluator_helper, cost, dynamics, x0)
 
     @jit
     def merit_function(V, g, c, rho):
-        return g + np.sum((V + 0.5 * rho * c) * c)
+        # Ensure rho is typed and broadcast-safe
+        rho = _as_dtype(rho, c.dtype)
+        return (g + np.sum((V + _fconst(0.5, c.dtype) * rho * c) * c)).astype(c.dtype)
 
     @jit
     def direction_and_merit(X, U, V, g, c):
-        # dX, dU, dV, q, r = compute_search_direction_kkt(
-        #     cost,
-        #     dynamics,
-        #     x0,
-        #     X,
-        #     U,
-        #     V,
-        #     make_psd,
-        #     psd_delta,
-        # )
-
+        # If you want KKT direction instead, keep it but still dtype-normalize there.
         dX, dU, dV, q, r = compute_search_direction(
             cost,
             dynamics,
@@ -358,30 +351,9 @@ def primal_dual_ilqr(
         )
 
         rho = merit_rho(c, dV)
-
         merit = merit_function(V, g, c, rho)
 
-        merit_slope = slope(
-            dX,
-            dU,
-            dV,
-            c,
-            q,
-            r,
-            rho,
-        )
-
-        # @jit
-        # def f(x):
-        #     gg, cc = model_evaluator(X + x * dX, U + x * dU)
-        #     return merit_function(V + x * dV, gg, cc, rho)
-        # auto_merit_slope = grad(f)(0.0)
-
-        # debug.print(f"{auto_merit_slope=}")
-        # debug.print(f"{merit_slope=}")
-        # debug.print(f"MERIT FUNCTION SLOPE ERROR: {auto_merit_slope - merit_slope}")
-
-        # merit_slope = auto_merit_slope
+        merit_slope = slope(dX, dU, dV, c, q, r, rho)
 
         return dX, dU, dV, rho, merit, merit_slope
 
@@ -408,14 +380,9 @@ def primal_dual_ilqr(
             alpha_min,
         )
 
-        (
-            dX_new,
-            dU_new,
-            dV_new,
-            rho_new,
-            merit_new,
-            merit_slope_new,
-        ) = direction_and_merit(X_new, U_new, V_new, g_new, c_new)
+        dX_new, dU_new, dV_new, rho_new, merit_new, merit_slope_new = direction_and_merit(
+            X_new, U_new, V_new, g_new, c_new
+        )
 
         return (
             X_new,
@@ -434,20 +401,22 @@ def primal_dual_ilqr(
         )
 
     def continuation_criterion(inputs):
-        _, _, _, dX, dU, dV, iteration, no_errors, _, c, _, _, slope = inputs
+        _, _, _, dX, dU, dV, iteration, no_errors, _, c, _, _, slope_val = inputs
 
-        c_sq_norm = np.sum(c * c)
-        slope_ok = np.abs(slope) > slope_threshold
-        delta_norm_sq = np.sum(dX * dX) + np.sum(dU * dU) + np.sum(dV * dV)
-        delta_norm_ok = delta_norm_sq > var_threshold**2
+        c_sq_norm = np.sum(c * c).astype(dt)
+        slope_ok = np.abs(slope_val) > slope_threshold
+        delta_norm_sq = (np.sum(dX * dX) + np.sum(dU * dU) + np.sum(dV * dV)).astype(dt)
+        delta_norm_ok = delta_norm_sq > var_threshold * var_threshold
         c_ok = c_sq_norm > c_sq_threshold
-        progress_ok = np.logical_or(np.logical_and(slope_ok, delta_norm_ok), c_ok)
 
+        progress_ok = np.logical_or(np.logical_and(slope_ok, delta_norm_ok), c_ok)
         status_ok = np.logical_and(no_errors, iteration < max_iterations)
 
         return np.logical_and(status_ok, progress_ok)
 
     g, c = model_evaluator(X_in, U_in)
+    g = _as_dtype(g, dt)
+    c = _as_dtype(c, dt)
 
     dX, dU, dV, rho, merit, merit_slope = direction_and_merit(X_in, U_in, V_in, g, c)
 

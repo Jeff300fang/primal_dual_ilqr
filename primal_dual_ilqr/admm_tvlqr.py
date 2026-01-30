@@ -364,7 +364,7 @@ def admm_residuals(z, w, w_prev, y, rho, eps_abs=1e-2, eps_rel=1e-2):
 
 def adaptive_rho_update(rp_norm, rd_norm, rho,
                         clip_min=0.2, clip_max=5,
-                        rho_min=1e-2, rho_max=1e5,
+                        rho_min=1e-4, rho_max=1e5,
                         eps=1e-12):
     """
     Adaptive rho update using residual ratio directly as scaling,
@@ -604,7 +604,7 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     n = Q.shape[1]
     nx = Q.shape[-1]
     nu = R.shape[-1]
-    f = f - cfg.eps_abs
+    # f = f - cfg.eps_abs
     # Pad terminal for consistency with x_{T} term
     R = jnp.concatenate([R, jnp.zeros((1, nu, nu), dtype=R.dtype)], axis=0)
     r = jnp.concatenate([r, jnp.zeros((1, nu), dtype=r.dtype)], axis=0)

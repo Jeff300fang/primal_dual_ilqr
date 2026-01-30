@@ -239,25 +239,51 @@ def primal_convergence_metric(
 #     h_ct_all = jnp.concatenate([h_ct, h_ct_obstacle], axis=1)
 #     return h_ct_all
 
+# def add_obstacle_tightenings(
+#     obstacles: jnp.ndarray,
+#     primal_pos: jnp.ndarray,
+#     h_ct: jnp.ndarray,
+#     tightened_constraints: jnp.ndarray,
+#     idx_px: int = 0,
+#     idx_py: int = 1,
+# ):
+#     pos = primal_pos[:, :2]
+#     centers = obstacles[:, :2]
+#     radii = obstacles[:, 2]
+
+#     over = jnp.sqrt(h_ct[:, idx_px]**2 + h_ct[:, idx_py]**2)
+
+#     dist = jnp.linalg.norm(pos[:, None, :] - centers[None, :, :], axis=-1)
+
+#     tightened = dist - radii[None, :] - over[:, None]
+#     tightened_all = jnp.concatenate([tightened_constraints, tightened], axis=1)
+#     return tightened_all
 def add_obstacle_tightenings(
-    obstacles: jnp.ndarray,
-    primal_pos: jnp.ndarray,
-    h_ct: jnp.ndarray,
+    obstacles: jnp.ndarray,        # (M,3) [cx,cy,r]
+    primal_pos: jnp.ndarray,        # (T, nx) or (T,2) nominal state
+    h_ct: jnp.ndarray,              # (T, nx) tube half-widths in state coords
     tightened_constraints: jnp.ndarray,
     idx_px: int = 0,
     idx_py: int = 1,
+    eps: float = 1e-6,
 ):
-    pos = primal_pos[:, :2]
-    centers = obstacles[:, :2]
-    radii = obstacles[:, 2]
+    pos = primal_pos[:, :2]              # (T,2)
+    centers = obstacles[:, :2]           # (M,2)
+    radii = obstacles[:, 2]              # (M,)
 
-    over = jnp.sqrt(h_ct[:, idx_px]**2 + h_ct[:, idx_py]**2)
+    diff = pos[:, None, :] - centers[None, :, :]     # (T,M,2)
+    dist = jnp.linalg.norm(diff, axis=-1) + eps      # (T,M)
+    n = diff / dist[..., None]                        # (T,M,2) unit normal
 
-    dist = jnp.linalg.norm(pos[:, None, :] - centers[None, :, :], axis=-1)
+    hx = jnp.abs(h_ct[:, idx_px])                     # (T,)
+    hy = jnp.abs(h_ct[:, idx_py])                     # (T,)
 
-    tightened = dist - radii[None, :] - over[:, None]
-    tightened_all = jnp.concatenate([tightened_constraints, tightened], axis=1)
-    return tightened_all
+    # directional support function of an axis-aligned box in direction n
+    over = jnp.abs(n[..., 0]) * hx[:, None] + jnp.abs(n[..., 1]) * hy[:, None]  # (T,M)
+
+    tightened = dist - radii[None, :] - over          # (T,M)
+    return jnp.concatenate([tightened_constraints, tightened], axis=1)
+
 
 
 @partial(jit, static_argnums=(0, 15))
@@ -283,7 +309,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
     u0 = jnp.zeros((T, nu),  dtype=Q.dtype)
     v0 = jnp.zeros((Tp1, nx), dtype=Q.dtype)
 
-    i0 = jnp.array(0, dtype=jnp.int32)
+    i0 = jnp.array(0, dtype=rho.dtype)
     converged0 = jnp.array(False)
 
     max_iter = jnp.array(sls_config.max_sls_iterations, dtype=jnp.int32)
@@ -313,7 +339,7 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
 
         w   = lax.select(warm_flag, w, jnp.zeros_like(w))
         y   = lax.select(warm_flag, y, jnp.zeros_like(y))
-        rho = lax.select(warm_flag, rho, jnp.array(30.0))
+        rho = lax.select(warm_flag, rho, jnp.array(30.0, dtype=rho.dtype))
         x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
@@ -326,10 +352,15 @@ def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
         Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
-
-        rho = jnp.maximum(jnp.minimum(rho, 1e4) * 0.9, 0.1)
+        dtype = rho.dtype
+        c1e4 = jnp.asarray(1e4, dtype=dtype)
+        c09  = jnp.asarray(0.9, dtype=dtype)
+        c01  = jnp.asarray(0.1, dtype=dtype)
+        rho = jnp.maximum(jnp.minimum(rho, c1e4) * c09, c01)
         y = prev_rho / rho * y
-
+        rho = jnp.asarray(rho, dtype=prev_rho.dtype)     # <- this fixes the crash
+        w   = jnp.asarray(w,   dtype=w.dtype)            # optional (no-op unless constrained_solve changes it)
+        y   = jnp.asarray(y,   dtype=y.dtype)            # optional
         converged_now = metric <= tol
         not_first = (i != 0)
         converged = jnp.logical_or(converged, converged_now)

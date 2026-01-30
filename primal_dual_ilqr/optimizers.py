@@ -18,9 +18,10 @@ class SQPConfig:
     feas_tol: float = 1e-2
     step_tol: float = 1e-4
     warm_start: bool = True
+    line_search: bool = True
 
     def tree_flatten(self):
-        children = (self.max_sqp_iterations, self.feas_tol, self.step_tol, self.warm_start)
+        children = (self.max_sqp_iterations, self.feas_tol, self.step_tol, self.warm_start, self.line_search)
         return children, None
 
     @classmethod
@@ -160,6 +161,7 @@ def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
     C_all = jnp.concatenate([C, C_obstacle], axis=1)
     D_all = jnp.concatenate([D, D_obstacle], axis=1)
     f_all = jnp.concatenate([f, f_obstacle], axis=1)
+    
     return C_all, D_all, f_all
 
 
@@ -242,7 +244,8 @@ def compute_search_direction(
     # TODO: Correctly set Q_bar and R_bar?
     Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[1]), Q.shape)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]), R.shape)
-    # Q_bar = Q
+    # single_q = jnp.diag(jnp.array([1000.0, 1000.0, 0.0]))
+    # Q_bar = jnp.broadcast_to(single_q, Q.shape)
     # R_bar = R
     if sls_config.enable_fastsls:
         dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u = fast_sls_solve_gpu(
@@ -753,7 +756,7 @@ def mpc(
 
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
-            rho0 = lax.select(warm_flag, rho, jnp.asarray(30.0))
+            rho0 = lax.select(warm_flag, rho, jnp.asarray(10.0, dtype=rho.dtype))
             # Compute search direction
             h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1 = compute_search_direction(
@@ -803,17 +806,27 @@ def mpc(
 
             merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)
 
-            # X_next, U_next, V_next, g_new, c_new, ok = line_search(
-            #     merit_fn, model_evaluator,
-            #     X_curr, U_curr, V_curr,
-            #     dX, dU, dV,
-            #     current_merit, g, c,
-            #     merit_slope,
-            #     armijo_factor=1e-4,
-            #     alpha_0=1.0,
-            #     alpha_mult=0.5,
-            #     alpha_min=1e-6,
-            # )
+            last_iter = (i == (sqp_config.max_sqp_iterations - 1))
+            do_ls = jnp.logical_and(jnp.array(bool(sqp_config.line_search)), jnp.logical_not(last_iter))
+
+            def ls_branch(_):
+                Xn, Un, Vn, g_new, c_new, ok = line_search(
+                    merit_fn, model_evaluator,
+                    X_curr, U_curr, V_curr,
+                    dX, dU, dV,
+                    current_merit, g, c,
+                    merit_slope,
+                    armijo_factor=1e-4,
+                    alpha_0=1.0,
+                    alpha_mult=0.5,
+                    alpha_min=1e-6,
+                )
+                return Xn, Un, Vn
+
+            def fullstep_branch(_):
+                return (X_curr + dX, U_curr + dU, V_curr + dV)
+
+            X_next, U_next, V_next = lax.cond(do_ls, ls_branch, fullstep_branch, operand=None)
 
             # Keep the latest aux outputs; if converged, keep prior ones
             w_next = lax.select(converged1, w, w1)
