@@ -5,9 +5,9 @@ import jax.numpy as jnp
 from functools import partial
 
 from trajax.optimizers import linearize, quadratize,vectorize
-from quad_mpc_constrained.mpx.mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import fast_sls_solve_gpu
-from quad_mpc_constrained.mpx.mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import SLSConfig
-from quad_mpc_constrained.mpx.mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
+from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import fast_sls_solve_gpu
+from mpx.primal_dual_ilqr.primal_dual_ilqr.fast_sls import SLSConfig
+from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
 from jax.tree_util import register_pytree_node_class
 from dataclasses import dataclass
 
