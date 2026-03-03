@@ -165,7 +165,7 @@ def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
     return C_all, D_all, f_all
 
 
-@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+@partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 def compute_search_direction(
     sls_config: SLSConfig,
     admm_config,
@@ -173,15 +173,14 @@ def compute_search_direction(
     dynamics,
     hessian_approx,
     limited_memory,
-    constraints, disturbance, rhs_tm_fn, splts_cfg,
-    obstacles,
+    constraints, disturbance, obstacles,
     x0,
     X,
     U,
     V,
     c,
     w, y, rho,
-    h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws,
+    h_ct_ws, beta_ws, mu_ws
 ):
     """Computes the SQP search direction.
 
@@ -245,12 +244,12 @@ def compute_search_direction(
     # TODO: Correctly set Q_bar and R_bar?
     Q_bar = jnp.broadcast_to(jnp.eye(Q.shape[1]), Q.shape)
     R_bar = jnp.broadcast_to(jnp.eye(R.shape[1]), R.shape)
-    single_q = jnp.diag(jnp.array([1000.0, 1000.0, 0.0]))
-    Q_bar = jnp.broadcast_to(single_q, Q.shape)
+    # single_q = jnp.diag(jnp.array([1000.0, 1000.0, 0.0]))
+    # Q_bar = jnp.broadcast_to(single_q, Q.shape)
     # R_bar = R
     if sls_config.enable_fastsls:
         dX, dU, dV, w, y, rho, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN = fast_sls_solve_gpu(
-            cfg, rhs_tm_fn, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, sls_config, splts_cfg, E, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, X, U,
+            cfg, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho, sls_config, E, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws
         )
     else:
         dX, dU, dV, w, y, rho, _, converged_admm = constrained_solve(
@@ -260,8 +259,6 @@ def compute_search_direction(
         backoffs = jnp.zeros((T + 1, nc - obstacles.shape[0]))
         Phi_x = jnp.zeros((T + 1, T + 1, nx, nx))
         Phi_u = jnp.zeros((T, T + 1, nu, nx))
-        betaN = jnp.ones((T + 1, T + 1, nc - obstacles.shape[0])) * 1e-10
-        muN = jnp.zeros((T + 1, nc))
 
     # def converged_branch(state):
     #     # state = (w, y, rho)
@@ -703,7 +700,7 @@ def model_evaluator_helper(cost, dynamics,x0, X, U):
     return g, c
 
 
-@partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8,9,10))
+@partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8))
 def mpc(
     sls_config: SLSConfig,
     sqp_config: SQPConfig,
@@ -714,8 +711,6 @@ def mpc(
     limited_mempory,
     constraints,
     disturbance,
-    rhs_tm_fn,
-    splts_cfg,
     reference,
     parameter,
     W,
@@ -727,7 +722,7 @@ def mpc(
     y,
     rho,
     obstacles,
-    h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws
+    h_ct_ws, beta_ws, mu_ws
 ):
     Tp1 = X_in.shape[0]
     nx = X_in.shape[1]
@@ -761,8 +756,7 @@ def mpc(
 
             w0   = lax.select(warm_flag, w, jnp.zeros_like(w))
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
-            # TODO: Make the defualt rho a parameter
-            rho0 = lax.select(warm_flag, rho, jnp.asarray(10.0, dtype=rho.dtype))
+            rho0 = lax.select(warm_flag, rho, jnp.asarray(0.01, dtype=rho.dtype))
             # Compute search direction
             h_ct_ws = backoffs
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN = compute_search_direction(
@@ -774,8 +768,6 @@ def mpc(
                 limited_mempory,
                 constraints,
                 disturbance,
-                rhs_tm_fn,
-                splts_cfg,
                 obstacles,
                 x0,
                 X_curr,
@@ -783,7 +775,7 @@ def mpc(
                 V_curr,
                 c,
                 w0, y0, rho0,
-                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws,
+                h_ct_ws, beta_ws, mu_ws
             )
 
             # Convergence criterion 2: relative step size (infinity norm)
@@ -855,7 +847,10 @@ def mpc(
     # Initialize carry; backoffs/Phi_* placeholders must be valid JAX values
     # If you have natural initial values, use them instead.
     backoffs0 = h_ct_ws
-    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws)
+    Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
+    Phi_u0 = jnp.zeros((Tp1 - 1, Tp1, nu, nx))
+
+    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x0, Phi_u0, beta_ws, mu_ws)
     total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN = lax.fori_loop(
         0, sqp_config.max_sqp_iterations, body, carry0
     )

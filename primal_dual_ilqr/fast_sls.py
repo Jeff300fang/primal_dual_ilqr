@@ -7,9 +7,6 @@ from jax import lax, vmap
 from mpx.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
 from mpx.primal_dual_ilqr.primal_dual_ilqr.admm_tvlqr import constrained_solve
 from dataclasses import dataclass
-from mpx.linearization_sls.src.helper import make_step_boxes, build_linear_tm, prepare_initial_set
-from mpx.linearization_sls.src.rhs_eval import build_auto_rhs_analytic
-from mpx.linearization_sls.src.taylor_model import QuadTM
 
 @dataclass(frozen=True)
 class SLSConfig:
@@ -227,7 +224,40 @@ def primal_convergence_metric(
     mU = _scaled_primal_diff(U_new, U_old)
     return jnp.maximum(mX, mU)
 
-@jax.jit
+# def add_obstacle_tightenings(obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct: jnp.ndarray):
+#     Tp1 = h_ct.shape[0]
+#     num_obstacles = obstacles.shape[0]
+#     h_ct_obstacle = jnp.zeros((Tp1, num_obstacles))
+#     for i in range(Tp1):
+#         pos = primal_pos[i, :2]
+#         for j in range(num_obstacles):
+#             over_approx = jnp.sqrt(h_ct[i, 0] ** 2 + h_ct[i, 1] ** 2)
+#             center = obstacles[j, :2]
+#             radius = obstacles[j, 2]
+#             tightened = jnp.linalg.norm(pos - center) - radius - over_approx
+#             h_ct_obstacle = h_ct_obstacle.at[i, j].set(tightened)
+#     h_ct_all = jnp.concatenate([h_ct, h_ct_obstacle], axis=1)
+#     return h_ct_all
+
+# def add_obstacle_tightenings(
+#     obstacles: jnp.ndarray,
+#     primal_pos: jnp.ndarray,
+#     h_ct: jnp.ndarray,
+#     tightened_constraints: jnp.ndarray,
+#     idx_px: int = 0,
+#     idx_py: int = 1,
+# ):
+#     pos = primal_pos[:, :2]
+#     centers = obstacles[:, :2]
+#     radii = obstacles[:, 2]
+
+#     over = jnp.sqrt(h_ct[:, idx_px]**2 + h_ct[:, idx_py]**2)
+
+#     dist = jnp.linalg.norm(pos[:, None, :] - centers[None, :, :], axis=-1)
+
+#     tightened = dist - radii[None, :] - over[:, None]
+#     tightened_all = jnp.concatenate([tightened_constraints, tightened], axis=1)
+#     return tightened_all
 def add_obstacle_tightenings(
     obstacles: jnp.ndarray,        # (M,3) [cx,cy,r]
     primal_pos: jnp.ndarray,        # (T, nx) or (T,2) nominal state
@@ -254,92 +284,18 @@ def add_obstacle_tightenings(
     tightened = dist - radii[None, :] - over          # (T,M)
     return jnp.concatenate([tightened_constraints, tightened], axis=1)
 
-def estimate_remainder_TM(tm_fn, x_lo, x_up, state_dim, splits_cfg={}):
-    B, D = x_lo.shape
-    step_lo, step_hi, _, _ = make_step_boxes(B, D, h=1.0)
-
-    c = 0.5 * (x_lo + x_up)
-    S = 0.5 * (x_up - x_lo)
-    x_tm0 = build_linear_tm(c, S)
-
-    x_tmnext_nom = tm_fn(x_tm0, step_lo, step_hi)
-    c_tm = x_tmnext_nom.P.c
-    J_tm = x_tmnext_nom.P.L[:, :, 1:] / S[:, None, :]
-    A_tm = J_tm[:, :state_dim, :state_dim]
-    B_tm = J_tm[:, :state_dim, state_dim:]
-
-    # split initial box to refine remainder estimate
-    step_lo_split, step_hi_split = prepare_initial_set(step_lo, step_hi, splits_cfg)
-    n_splits = step_lo_split.shape[0] // B
-    x_tm0_split = QuadTM.repeat(x_tm0, n_splits)
-
-    x_tmnext_split: QuadTM = tm_fn(x_tm0_split, step_lo_split, step_hi_split)
-    remainder = x_tmnext_split.R
-
-    agg_r_lb = jnp.min(remainder.lo.reshape((B, -1, D)), axis=1)
-    agg_r_ub = jnp.max(remainder.hi.reshape((B, -1, D)), axis=1)
-    r_bound = jnp.maximum(jnp.abs(agg_r_lb), jnp.abs(agg_r_ub))
-
-    return r_bound[..., :state_dim], c_tm, A_tm, B_tm
-
-def get_tube_width(Phi_x, Phi_u):
-    return jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1), jnp.linalg.norm(Phi_u, ord=2, axis=-1).sum(axis=1)
 
 
-def get_combined_disturbance(
-    E, alpha_1, alpha_2,
-    X, U, Phi_x, Phi_u,
-    rhs_tm_fn, splits_cfg
-):
-    """
-    E: (T, nx, nx)
-    X: (T+1, nx)
-    U: (T, nu)
-    Returns:
-      E_combined: (T, nx, nx)
-    """
-    T  = U.shape[0]
-    nx = X.shape[1]
-
-    # Tube half-widths per stage
-    # x_tube_widths: (T+1, nx), u_tube_widths: (T, nu)
-    x_tube_widths, u_tube_widths = get_tube_width(Phi_x, Phi_u)
-    U = jnp.concatenate([U, U[-1:]], axis=0)  # append last row
-    # Build batched boxes (one per stage k=0..T-1)
-    state_stacked = jnp.concatenate([X, U], axis=-1)  # (T, nx+nu)
-    zeros = jnp.zeros((u_tube_widths.shape[1], 1), dtype=u_tube_widths.dtype)
-    u_tube_widths = jnp.concatenate([u_tube_widths, zeros], axis=0)
-    width_stacked = jnp.concatenate(
-        [x_tube_widths, u_tube_widths],
-        axis=-1
-    )  # (T, nx+nu)
-
-    x_lo = state_stacked - width_stacked                  # (T, nx+nu)
-    x_up = state_stacked + width_stacked                  # (T, nx+nu)
-    # r_bound_tm: (T, nx)  (one bound per stage box)
-    r_bound_tm, c_tm, A_tm, B_tm = estimate_remainder_TM(
-        rhs_tm_fn, x_lo, x_up, state_dim=nx, splits_cfg=splits_cfg
-    )
-    # diag_r: (T, nx, nx)
-    diag_r = jax.vmap(jnp.diag)(r_bound_tm)
-
-    # Combine: (T, nx, nx)
-    E_combined = (1.0 / alpha_1) * E + (1.0 / alpha_2) * diag_r
-    # E_combined = (1.0 / alpha_1) * E 
-    # E_combined = E
-    return E_combined
-
-
-@partial(jit, static_argnums=(0, 1, 16, 17))
-def fast_sls_solve_gpu(cfg, rhs_tm_fn, Q: jnp.ndarray, q: jnp.ndarray,
+@partial(jit, static_argnums=(0, 15))
+def fast_sls_solve_gpu(cfg, Q: jnp.ndarray, q: jnp.ndarray,
                        R: jnp.ndarray, r: jnp.ndarray,
                        M: jnp.ndarray,
                        A: jnp.ndarray, B: jnp.ndarray, c: jnp.ndarray,
                        C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
-                       sls_config: SLSConfig, splits_cfg, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
+                       sls_config: SLSConfig, E: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
-                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray, X: jnp.ndarray, U: jnp.ndarray):
+                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray):
     # Solve Nominal Trajectory
     
     Tp1 = Q.shape[0]
@@ -362,23 +318,16 @@ def fast_sls_solve_gpu(cfg, rhs_tm_fn, Q: jnp.ndarray, q: jnp.ndarray,
     tol = jnp.array(sls_config.sls_primal_tol, dtype=Q.dtype)
 
     h_ct0 = h_ct_ws
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws)
+    Phi_x0 = jnp.zeros((Tp1, Tp1, nx, nx))
+    Phi_u0 = jnp.zeros((T, Tp1, nu, nx))
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x0, Phi_u0, mu_ws)
 
     def cond_fn(carry):
         i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, _, _, _, _ = carry
         return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu = carry
-        # jax.debug.print("{}", Phi_x_prev)
-        
-        # TODO: Unhardcode these
-        alpha_1 = 0.7
-        alpha_2 = 0.3
-
-        # Linearization Error
-        # E_aug = get_combined_disturbance(E, alpha_1, alpha_2, X, U, Phi_x_prev, Phi_u_prev, rhs_tm_fn, splits_cfg)
-        E_aug = E
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, _, _, mu = carry
 
         prev_rho = rho
         x_prev = x_curr
@@ -387,7 +336,7 @@ def fast_sls_solve_gpu(cfg, rhs_tm_fn, Q: jnp.ndarray, q: jnp.ndarray,
         eta_stage, eta_f = get_etas(mu_nominal, beta)
         C_box = C[:, :nc - num_obstacles, :]
         D_box = D[:, :nc - num_obstacles, :]
-        Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E_aug, eta_stage, eta_f)
+        Phi_x, Phi_u = get_controller(Q_bar, R_bar, A, B, C_box, D_box, E, eta_stage, eta_f)
         beta = get_betas(C_box, D_box, Phi_x, Phi_u)
         h_ct = get_constraint_tightenings(beta)
         tightened_constraints = f[:, :-num_obstacles] - h_ct
